@@ -58,6 +58,8 @@ class alignas(64) CentralList {
 
   // Test hook: number of batches in the transfer cache.
   unsigned cached_batches();
+  // Same, for a caller that already holds the lock (memloc_stats, D-28).
+  unsigned cached_batches_locked() const { return num_batches_; }
 
   // Bytes of whole batches one class may park in its transfer cache. D-17
   static constexpr std::size_t kTransferBytes = std::size_t{1} << 20;

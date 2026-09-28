@@ -42,7 +42,7 @@ Chunk* PageHeap::grow() {
   return c;
 }
 
-Span* PageHeap::alloc_span(unsigned units) {
+Span* PageHeap::alloc_span(unsigned units, SpanKind kind) {
   const std::scoped_lock lock(mu_);
   Chunk* chunk = nullptr;
   int first = -1;
@@ -66,6 +66,7 @@ Span* PageHeap::alloc_span(unsigned units) {
   Span* s = &chunk->spans[u];
   *s = Span{};
   s->units = static_cast<std::uint8_t>(units);
+  s->kind = kind;  // under mu_, so memloc_stats() can read it (D-28)
   return s;
 }
 

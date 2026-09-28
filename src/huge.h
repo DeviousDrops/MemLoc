@@ -40,4 +40,8 @@ std::size_t huge_usable_size(const void* p);
 // Grows or shrinks with mremap; returns nullptr (p still valid) on failure.
 void* huge_realloc(void* p, std::size_t n);
 
+// Live huge blocks and the total length of their mappings (D-28).
+std::size_t huge_live_count();
+std::size_t huge_live_bytes();
+
 }  // namespace memloc

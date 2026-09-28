@@ -40,14 +40,19 @@ class PageHeap {
  public:
   constexpr PageHeap() = default;
 
-  // Returns a span of `units` contiguous units with kind, size_class and all
-  // list fields zeroed, or nullptr if the OS refuses more memory.
-  Span* alloc_span(unsigned units);
+  // Returns a span of `units` contiguous units of the given kind, with
+  // size_class and all list fields zeroed, or nullptr if the OS refuses more
+  // memory.
+  Span* alloc_span(unsigned units, SpanKind kind);
   void free_span(Span* s);
 
   // fork() support (D-20): hold the heap's lock across fork.
   void lock() { mu_.lock(); }
   void unlock() { mu_.unlock(); }
+
+  // First chunk of the list of all chunks (linked through Chunk::next).
+  // Requires mu_; memloc_stats() walks it (D-28).
+  Chunk* first_chunk() const { return first_; }
 
   std::size_t mapped_bytes() const {
     return chunk_count_.load(std::memory_order_relaxed) * kChunkSize;

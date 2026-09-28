@@ -39,9 +39,8 @@ unsigned CentralList::fetch(unsigned cls, unsigned n, void** head) {
   while (got < n) {
     Span* s = spans_;
     if (s == nullptr) {
-      s = g_page_heap.alloc_span(span_units(cls));
+      s = g_page_heap.alloc_span(span_units(cls), SpanKind::kSmall);
       if (s == nullptr) break;
-      s->kind = SpanKind::kSmall;
       s->size_class = static_cast<std::uint8_t>(cls);
       s->carve = span_base(s);
       s->limit = s->carve + objects_per_span(cls) * size;

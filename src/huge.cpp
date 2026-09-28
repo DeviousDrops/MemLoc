@@ -1,5 +1,6 @@
 #include "huge.h"
 
+#include <atomic>
 #include <cerrno>
 
 #include "config.h"
@@ -9,6 +10,10 @@
 namespace memloc {
 
 namespace {
+
+// Live huge blocks and the bytes their mappings cover (D-28).
+constinit std::atomic<std::size_t> g_huge_count{0};
+constinit std::atomic<std::size_t> g_huge_bytes{0};
 
 // Offset of the user pointer from the mapping base for a given alignment.
 std::size_t user_offset(std::size_t align) {
@@ -52,14 +57,21 @@ void* huge_alloc(std::size_t n, std::size_t align) {
   h->magic = kHugeMagic;
   h->base = base;
   h->map_len = len;
+  g_huge_count.fetch_add(1, std::memory_order_relaxed);
+  g_huge_bytes.fetch_add(len, std::memory_order_relaxed);
   return p;
 }
 
 void huge_free(void* p) {
   HugeHeader* h = checked_header(p, "free(): invalid pointer");
   h->magic = 0;
+  g_huge_count.fetch_sub(1, std::memory_order_relaxed);
+  g_huge_bytes.fetch_sub(h->map_len, std::memory_order_relaxed);
   os_unmap(h->base, h->map_len);
 }
+
+std::size_t huge_live_count() { return g_huge_count.load(std::memory_order_relaxed); }
+std::size_t huge_live_bytes() { return g_huge_bytes.load(std::memory_order_relaxed); }
 
 std::size_t huge_usable_size(const void* p) {
   const HugeHeader* h = checked_header(p, "malloc_usable_size(): invalid pointer");
@@ -81,6 +93,8 @@ void* huge_realloc(void* p, std::size_t n) {
     errno = ENOMEM;
     return nullptr;
   }
+  g_huge_bytes.fetch_add(len, std::memory_order_relaxed);
+  g_huge_bytes.fetch_sub(huge_header(base + offset)->map_len, std::memory_order_relaxed);
   char* q = base + offset;
   huge_header(q)->base = base;
   huge_header(q)->map_len = len;

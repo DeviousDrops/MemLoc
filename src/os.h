@@ -21,6 +21,10 @@ void* os_map_aligned(std::size_t len, std::size_t align);
 
 void os_unmap(void* p, std::size_t len);
 
+// Bytes currently mapped by os_map/os_remap, and the peak so far (D-28).
+std::size_t os_mapped_bytes();
+std::size_t os_peak_mapped_bytes();
+
 // Resizes a mapping; the kernel may move it (MREMAP_MAYMOVE). D-11
 void* os_remap(void* p, std::size_t old_len, std::size_t new_len);
 
