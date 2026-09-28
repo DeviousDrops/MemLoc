@@ -1,0 +1,9 @@
+/build*/
+/.cache/
+/.claude/
+compile_commands.json
+__pycache__/
+*.pyc
+/bench/results/raw/
+/triage-out/
+.env
