@@ -1,9 +1,11 @@
 # Convenience wrapper around CMake. All real build logic lives in CMakeLists.txt.
 BUILD ?= $(HOME)/build/memloc
 TSAN_BUILD ?= $(HOME)/build/memloc-tsan
+PYTHON ?= python3
+LLM ?= claude
 GEN := $(shell command -v ninja >/dev/null && echo -G Ninja)
 
-.PHONY: all build test bugs bench plots tsan format format-fix tidy clean
+.PHONY: all build test bugs triage-eval bench plots tsan format format-fix tidy clean
 
 all: test
 
@@ -19,7 +21,13 @@ bugs: build
 	tools/run_bugs.py --lib $(BUILD)/src/libmemloc.so --bin-dir $(BUILD)/tests/bugs \
 	  --keep $(BUILD)/bug-reports
 
-# Full benchmark run (~15 min): glibc vs mimalloc vs MemLoc, then the graphs.
+# LLM triage of the bug reports, scored against tests/bugs/expected.json.
+# Needs ANTHROPIC_API_KEY and the anthropic package; LLM=mock runs offline.
+triage-eval: bugs
+	$(PYTHON) tools/triage.py eval --reports $(BUILD)/bug-reports --llm $(LLM) \
+	  --trace $(BUILD)/triage-trace.jsonl
+
+# Full benchmark run (~2 min): glibc vs mimalloc vs MemLoc, then the graphs.
 bench: build
 	tools/bench.py --build $(BUILD)
 	tools/plot_bench.py --table
