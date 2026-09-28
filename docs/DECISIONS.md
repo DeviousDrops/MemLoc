@@ -595,3 +595,189 @@ Interview Q:  "How do you prove the program actually used your allocator?" -
               Ask the dynamic linker. `dladdr` on the resolved malloc
               address names the defining object, and `LD_DEBUG=bindings`
               logs each symbol binding.
+
+## D-22: A debug mode that costs nothing when off            (Phase 4)
+Context:      `MEMLOC_DEBUG=1` must turn on heavy checking at run time. The
+              brief also requires that the normal build pay nothing for it.
+Options:      A) a separate debug build of the library; B) test a global
+              flag at the top of every entry point; C) keep the fast paths
+              flag-free and consult the flag only on paths that are already slow
+Choice:       C. malloc and free (and calloc) are restructured as
+              "try the thread cache inline, else call a noinline slow path".
+              Only the slow path reads `g_debug`. In debug mode the thread
+              caches are never used: they stay empty, and the main thread's
+              pre-debug cache is flushed when debug mode starts. So every
+              call falls through to the slow path, where the debug
+              allocator takes over. realloc, memalign and malloc_usable_size
+              test the flag once at entry (a predictable branch). They are not
+              the paths that dominate allocation-heavy programs.
+              The flag is set by a constructor that reads the environment, so
+              the few allocations made before it ran are ordinary blocks.
+              The debug allocator recognises them (see D-23) and frees them
+              normally.
+Why:          It keeps the promise literally for the hot paths: the
+              objdump of the malloc/free fast paths contains no reference to
+              the flag (checked in Phase 4, recorded in PROGRESS). And one
+              binary serves both uses.
+Trade-off:    In debug mode, thread caches are off, so allocation takes the
+              central locks every time. Debug mode is for finding bugs,
+              not for speed.
+Interview Q:  "How can a runtime flag be zero-cost?" - Put the check where
+              the code is already paying for something slow. Debug mode
+              forces every call onto that slow path by keeping the caches
+              empty.
+
+## D-23: Debug block layout and what it detects            (Phase 4)
+Context:      The brief lists overflow/underflow (canaries), double free,
+              use-after-free (FIFO quarantine with 0xDD poison, checked on
+              eviction) and leaks grouped by call site.
+Options:      A) redzones in separate guard pages (Electric Fence: exact, but
+              one page per allocation); B) inline header + canaries around
+              each block, with a quarantine (ASan-like without shadow memory)
+Choice:       B. A debug block is an ordinary MemLoc block of
+              `208 + n + 16` bytes (plus alignment slack):
+
+                raw                                 user = raw+208      user+n
+                | DebugHeader (192 B)  | canary 16 B | user bytes ...   | canary 16 B |
+                  magic^user, size, raw, live-list links, tids,
+                  alloc stack[8], free stack[8]
+
+              - The magic is XORed with the user address, so a stray copy of it
+                in user data cannot make an unrelated address look like a
+                debug block. Live and freed blocks use different magics.
+              - free(): freed magic -> **double free**. No debug magic and not
+                the start of a normal block -> **invalid free**. Damaged front
+                or back canary -> **underflow** / **overflow**, with the first
+                bad offset.
+              - Freed blocks are filled with 0xDD and parked in a FIFO
+                quarantine (at most 4096 blocks / 64 MiB). On eviction, and for
+                every block still queued at exit, a byte that is no longer
+                0xDD means a **use-after-free write**.
+              - malloc() fills new blocks with 0xBE, which makes reads of
+                uninitialised memory visible. calloc still zeroes.
+              - realloc() always moves the block, so the old pointer goes
+                through quarantine. Stale pointers after realloc are then
+                caught like any other use-after-free.
+              - Live blocks are on a doubly linked list. At exit, blocks
+                still live are **leaks**, grouped by allocation stack.
+              malloc_usable_size() returns the requested size, so programs
+              that trust it never touch the canary.
+Why:          It finds every bug class in the brief with a fixed, small
+              per-block overhead. It needs no shadow memory and no compiler
+              instrumentation, so it works on unmodified binaries via
+              LD_PRELOAD.
+Trade-off:    Detection is deferred: an overflow is reported at free, and a
+              use-after-free write at eviction or exit. Neither is reported
+              at the faulting instruction as with ASan. Reads after free are
+              not detected. Blocks freed while debug mode starts up (before
+              the constructor) are ordinary and unchecked.
+Interview Q:  "Why XOR the magic with the address?" - A live header contains
+              the magic, so user data copied from another block's header
+              (or a pointer-sized value that happens to match) would fool a
+              constant magic. XORing with the block's own address makes a
+              header valid only at the one place it belongs.
+
+## D-24: Capturing and symbolising stacks            (Phase 4)
+Context:      Reports are only useful with call stacks: where the block was
+              allocated, freed and misused.
+Options:      A) frame-pointer walking (fast, but fails when the program is
+              built without frame pointers); B) glibc `backtrace()` (DWARF
+              unwinding via libgcc_s); C) libunwind (an extra dependency)
+Choice:       B, with three precautions:
+              - The first call of backtrace() dlopens libgcc_s, which
+                allocates. The constructor makes one warm-up call under the
+                recursion guard, so this never happens mid-report.
+              - A thread-local recursion guard sends any allocation made
+                *while* the debug allocator is working to the plain
+                allocator.
+              - Stacks are capped: 8 frames stored per allocation and per free,
+                32 frames for the current stack in a report. MemLoc's own
+                frames are skipped.
+              In-process symbolisation uses dladdr() only: module path,
+              offset in the module, and the nearest exported symbol (bug
+              programs are linked with `-rdynamic`). File and line come
+              offline from `tools/symbolize.py` (addr2line on module +
+              offset), because that needs DWARF parsing and memory, neither of
+              which belongs inside a crashing process.
+Why:          Correct stacks for any binary, and no extra dependency.
+Trade-off:    backtrace() costs microseconds per call, so debug mode slows
+              allocation-heavy programs considerably.
+Interview Q:  "Why not call addr2line from inside the crashing process?" -
+              The process is in an unknown state. Fork/exec and DWARF
+              parsing allocate and take locks. Record module + offset,
+              which is enough, and symbolise out of process.
+
+## D-25: Crash report format            (Phase 4)
+Context:      Reports feed both humans and the Phase 6 triage tool.
+Options:      A) human-readable text like ASan; B) JSON lines
+Choice:       B. One JSON object per line, written with `write(2)` from a
+              static buffer (no stdio, no malloc) to `$MEMLOC_REPORT`
+              (opened O_APPEND) or to stderr. A one-line human summary
+              always goes to stderr. Fields: `type`, `pid`, `tid`,
+              `program`, `address`, `size`, `detail`, `stack`,
+              `alloc_stack`, `free_stack`, and `heap` (mapped bytes, live
+              debug blocks and bytes, quarantine fill). Each frame is
+              `{pc, module, offset, symbol, symbol_offset}`. Errors then
+              `abort()`. Leaks do not abort. They produce one `leak`
+              record per allocation site and a `leak-summary`.
+              Leak groups whose allocation stack never leaves system libraries
+              (libc, libstdc++, ld.so, libmemloc itself) are counted
+              in the summary as `system_blocks`, not reported as sites.
+              Example: stdio's never-freed buffer.
+Why:          Machine-readable from the start. The triage tool groups by
+              `type` + top user frames without parsing text.
+Trade-off:    A leak here means "not freed at exit" with no reachability
+              scan (LSan scans roots). The system-library filter removes
+              most of the noise that causes.
+Interview Q:  "Why write reports with write(2) and a static buffer?" - The
+              heap is known to be corrupt when the report is written. Any
+              path that allocates, or takes stdio's lock (which may be held
+              by the thread that just crashed), can deadlock or crash again.
+
+## D-26: SIGSEGV handler            (Phase 4)
+Context:      Wild and null dereferences never reach the allocator. The brief
+              asks for a signal-safe handler that dumps allocator state.
+Options:      A) none (rely on core dumps); B) a handler that reports and
+              then lets the default action happen
+Choice:       B, installed only in debug mode, for SIGSEGV and SIGBUS. It runs
+              on a sigaltstack, so a stack overflow can still be reported.
+              The handler only uses async-signal-safe operations: write,
+              readlink, getpid, and lock-free reads of allocator counters
+              and span descriptors. It classifies the fault address as a
+              null page (< 4096), inside a MemLoc chunk (with span kind,
+              class and offset), or outside the heap. It then emits a `segv`
+              record, restores SIG_DFL, and returns: the fault repeats and
+              the process dies with the usual signal and core dump.
+              The stack comes from backtrace() plus the faulting PC from the
+              ucontext.
+Why:          The report is written, and the exit status and core dump are
+              exactly what they would have been without MemLoc.
+Trade-off:    backtrace() is not on POSIX's async-signal-safe list. After
+              the warm-up it neither allocates nor locks in practice (the
+              same pragmatic choice many crash reporters make). The heap
+              snapshot is read without locks, so it can be torn.
+Interview Q:  "What can you safely do in a SIGSEGV handler?" - Only
+              async-signal-safe functions: no malloc, no printf, no mutexes.
+              Pre-allocate everything (alt stack, buffers), format by hand,
+              write(2), then re-raise with the default disposition.
+
+## D-27: Bug-program suite            (Phase 4)
+Context:      "Debug mode catches all bug programs" must be checkable.
+Options:      A) gtest death tests (in-process, and they fight LD_PRELOAD);
+              B) standalone programs plus a runner
+Choice:       B. `tests/bugs/*.c|cpp`: 11 small programs, each with one
+              realistic bug (off-by-one strcpy, underflow, double free,
+              write-after-free, stale pointer after realloc, interior free,
+              freeing a stack address, leaks from two sites, null
+              dereference, C++ new[] overflow, cross-thread use-after-free).
+              They are built `-O0 -g -fno-builtin -rdynamic`.
+              `tests/bugs/expected.json` records each program's expected
+              report type, exit signal, the function the report must point
+              at, and the ground-truth root cause and fix (reused by the
+              Phase 6 evaluation). `tools/run_bugs.py` runs one program under
+              LD_PRELOAD with MEMLOC_DEBUG=1, symbolises the report and checks
+              it. It is registered with ctest (label `bugs`), so CI runs it.
+Why:          Each program is a regression test for one detector, run in
+              the configuration a user would really use.
+Trade-off:    Depends on addr2line (binutils) being installed. It is part of
+              build-essential, so CI has it.
