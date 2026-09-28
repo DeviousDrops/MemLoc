@@ -25,6 +25,20 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure -j4
 
+  tsan:
+    name: ThreadSanitizer (unit tests)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      # Newer runner kernels use high-entropy mmap ASLR that older TSan
+      # runtimes reject; lower it for this job only.
+      - run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Configure
+        run: CC=clang CXX=clang++ cmake -S . -B build -G Ninja -DMEMLOC_SANITIZER=thread -DMEMLOC_BUILD_BENCH=OFF
+      - run: cmake --build build
+      - run: TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build --output-on-failure -j4 -L unit
+
   format:
     runs-on: ubuntu-24.04
     steps:
