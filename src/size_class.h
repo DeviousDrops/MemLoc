@@ -41,13 +41,34 @@ inline constexpr auto kClassSize = [] {
 
 constexpr std::size_t class_size(unsigned c) { return kClassSize[c]; }
 
-// Smallest class whose size is >= n. Requires n <= kMaxSmall; 0 maps to class 0.
-constexpr unsigned size_to_class(std::size_t n) {
+// Smallest class whose size is >= n, computed arithmetically.
+constexpr unsigned compute_size_to_class(std::size_t n) {
   if (n <= 128) return n == 0 ? 0 : static_cast<unsigned>((n - 1) >> 4);
   // 2^lg < n <= 2^(lg+1); the quarter-step width in that range is 2^(lg-2).
   const auto lg = static_cast<unsigned>(std::bit_width(n - 1)) - 1;
   const auto step = static_cast<unsigned>((n - 1 - (std::size_t{1} << lg)) >> (lg - 2));
   return 8 + (lg - 7) * 4 + step;
+}
+
+// Requests up to 1 KiB (the common case) are looked up by 16-byte granule.
+// The arithmetic form branches on n <= 128, and a program mixing sizes on
+// both sides of it mispredicts that branch on about every other call. A
+// 65-byte table (one cache line and a bit, always hot) has no such branch.
+inline constexpr std::size_t kLookupMax = 1024;
+inline constexpr auto kClassLookup = [] {
+  std::array<std::uint8_t, kLookupMax / 16 + 1> table{};
+  for (std::size_t g = 0; g < table.size(); ++g) {
+    table[g] = static_cast<std::uint8_t>(compute_size_to_class(g * 16));
+  }
+  return table;
+}();
+
+// Smallest class whose size is >= n. Requires n <= kMaxSmall; 0 maps to class 0.
+constexpr unsigned size_to_class(std::size_t n) {
+  if (n <= kLookupMax) [[likely]] {
+    return kClassLookup[(n + 15) >> 4];
+  }
+  return compute_size_to_class(n);
 }
 
 // Classes up to 8 KiB use one 64 KiB unit; larger ones use four, so that the
@@ -73,6 +94,9 @@ constexpr bool classes_are_valid() {
     if (c > 0 && size_to_class(class_size(c - 1) + 1) != c) return false;  // no gaps
     if ((span_bytes % size) * 16 > span_bytes) return false;               // tail waste <= 1/16
     if (objects_per_span(c) < 2) return false;
+  }
+  for (std::size_t n = 0; n <= kLookupMax; ++n) {
+    if (size_to_class(n) != compute_size_to_class(n)) return false;  // table agrees
   }
   return class_size(kNumClasses - 1) == kMaxSmall;
 }

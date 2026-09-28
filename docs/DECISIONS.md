@@ -922,3 +922,27 @@ Why:          The plots and the prose come from the same files, so they
               cannot drift apart.
 Trade-off:    PNGs in git are binary diffs (tens of KiB each). This is
               accepted so the README renders on GitHub with no build step.
+
+## D-33: Table lookup for size classes up to 1 KiB            (Phase 5)
+Context:      The first larson run had MemLoc behind glibc at 1 thread (about
+              70 vs 83 M ops/s). Probing showed that every single size was fast
+              (100-125 M ops/s), and so was a 16-128 B mix. Only mixes that
+              crossed 128 B were slow, even with 20 live blocks. The
+              arithmetic `size_to_class` (D-1) branches on `n <= 128`, and
+              uniform 16-256 B requests take that branch in either direction
+              half of the time: about one misprediction per malloc.
+Options:      A) a branch-free arithmetic formula; B) a lookup table indexed
+              by 16-byte granule for small requests, as tcmalloc does
+Choice:       B. A 65-entry `uint8_t` table covers 0-1024 B. Above that, the
+              arithmetic form is kept (one predictable branch on
+              `n <= 1024`). A `static_assert` proves that the table and
+              the formula agree for every size up to 1 KiB.
+Why:          Measured with the same probe on mixed 16-256 B requests: 71 → 110
+              M ops/s. Single-size loads are unchanged.
+Trade-off:    65 bytes of read-only data, which is always in cache while
+              allocating.
+Interview Q:  "How did you find it?" - Bisect the workload, not the code:
+              single sizes fast, a mix below 128 fast, a mix across 128 slow
+              regardless of working-set size. That points to control flow,
+              not memory, and the only data-dependent branch on the path
+              was the class computation.
