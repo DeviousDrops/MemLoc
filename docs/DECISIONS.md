@@ -970,3 +970,110 @@ Interview Q:  "Your realloc is faster, so why is its peak RSS the highest?"
               Speed comes from avoiding copies. Peak RSS comes from what
               happens to freed spans: glibc trims and mremaps, MemLoc keeps
               every chunk it ever mapped for reuse. Two separate knobs.
+
+## D-35: Group reports by a stack signature            (Phase 6)
+Context:      One bug can produce many identical reports (every run, every
+              thread, every leak of the same site). Triage should cost one
+              LLM call per distinct bug, not per report.
+Options:      A) hash the raw PCs; B) hash module + offset; C) hash the
+              report type plus the function names of the innermost frames
+              outside libc, the loader and MemLoc, per stack.
+Choice:       C. The signature is `type` + up to 3 user-code functions from
+              each of `stack`, `alloc_stack` and `free_stack`, hashed to 12
+              hex digits. Frames without a function name fall back to
+              module basename + offset. `leak-summary` records are dropped
+              (they repeat the per-site leak records).
+Why:          PCs change with ASLR and offsets change with every rebuild,
+              while function names survive both. Keeping the three stacks
+              apart separates "same crash site, different allocation site",
+              which are usually different bugs.
+Trade-off:    Two different bugs in the same function with the same callers
+              merge into one group. Line numbers would split them but would
+              also split one bug after an unrelated edit.
+Interview Q:  "How is this different from crash bucketing at scale?" - It is
+              the same idea as Breakpad/Crashpad signatures, minus the
+              skip-lists for inlined and generic frames that a large
+              codebase needs.
+
+## D-36: Structured output via a JSON schema            (Phase 6)
+Context:      The tool must turn a free-text model answer into fields the
+              eval can score and a script can consume.
+Options:      A) ask for JSON in the prompt and parse it; B) a forced tool
+              call; C) `output_config.format` with a JSON schema.
+Choice:       C, with `additionalProperties: false` and every field required:
+              `bug_type`, `culprit_function`, `root_cause`, `fix`,
+              `confidence` (low/medium/high).
+Why:          The API guarantees schema-valid JSON, so there is no retry-on-
+              parse-error path. Forced tool choice is being removed on newer
+              models, and structured output is the documented replacement.
+Trade-off:    `refusal` and `max_tokens` stop reasons can still end a
+              response early, so the code checks `stop_reason` before
+              parsing. The client also re-checks the fields, which costs a
+              few lines.
+Interview Q:  "Why also validate after a guaranteed schema?" - The guarantee
+              covers the model's output, not the tool's own fakes and mocks.
+              The same validator guards the mock and the real path.
+
+## D-37: One Claude call per group, with source context            (Phase 6)
+Context:      A stack of function names is often not enough to find the
+              root cause. Knowing that `release_request` double-freed does
+              not say which earlier path freed the pointer.
+Choice:       One `messages.create` per group on `claude-opus-5` with
+              adaptive thinking. The prompt holds the report (type, detail,
+              and the three stacks as function file:line) and ±12 lines of
+              source around each user frame, resolved against the repository
+              if the recorded path does not exist. Server-side fallbacks
+              (`fallbacks: "default"`) are on. The API key comes only from
+              `ANTHROPIC_API_KEY`, which is never written anywhere.
+Why:          Source context turns "where" into "why". The model is the
+              skill's default, and fallbacks re-run a declined request
+              instead of returning an empty answer.
+Trade-off:    Prompts are a few KB per group. For 11 bug programs that is
+              negligible, and for a large crash corpus the groups (D-35)
+              bound the cost. The system prompt is shorter than the minimum
+              cacheable prefix, so there is no prompt caching.
+Interview Q:  "What stops the model from inventing a fix?" - Nothing in the
+              tool does, and the eval (D-38) measures how often it happens.
+              `confidence` lets a human sort the queue.
+
+## D-38: Evaluate against tests/bugs ground truth            (Phase 6)
+Context:      tests/bugs/expected.json records, for each of the 11 bugs,
+              the report type, the function to blame, a root cause and a fix.
+Options:      A) exact match only; B) string similarity; C) exact match for
+              the categorical fields, and an LLM judge for free text.
+Choice:       C. `type` and `culprit_function` must match exactly. With the
+              real model, a second call judges `root_cause` and `fix`
+              against the ground truth and returns two booleans with a reason.
+              Offline, the judge is a keyword-overlap heuristic.
+Why:          Root causes are paraphrases, so exact or fuzzy string matches
+              would score correct answers as wrong. The categorical fields are
+              cheap to check exactly and catch most failures.
+Trade-off:    An LLM judge can be lenient toward an LLM answer. Its reasons
+              are logged in the trace so a human can audit every verdict.
+              With 11 cases, one miss is 9 points, so the score is a smoke
+              test, not a benchmark.
+Interview Q:  "How would you trust the judge?" - Spot-check its verdicts
+              against human labels. Then measure agreement, and swap the
+              judge model to see whether scores move.
+
+## D-39: Mocked model and trace log            (Phase 6)
+Context:      CI and contributors have no API key, but the tool still needs
+              tests. Real runs need an audit trail.
+Choice:       `--llm auto` uses Claude when `ANTHROPIC_API_KEY` is set and
+              the rule-based mock otherwise. The mock picks the culprit from
+              the stack that the report type points at (alloc for overflows
+              and leaks, free for use-after-free, the crash stack otherwise).
+              That makes it a real baseline, not a stub. Every model call
+              appends one JSON line to a trace file: time, model, signature,
+              prompt, raw response, stop reason, token usage and latency.
+              Unit tests use the mock plus a fake client object that stands in
+              for the SDK.
+Why:          Tests run offline in milliseconds and cover the request shape,
+              refusal handling and parsing. The baseline shows what the LLM
+              adds beyond "blame the innermost frame". Traces make each eval
+              reproducible and debuggable.
+Trade-off:    The fake client can drift from the real SDK. One real
+              `make triage-eval` run is the check for that.
+Interview Q:  "What does the LLM beat the baseline on?" - Root cause and
+              fix. The baseline already names the function, but it cannot
+              explain an ownership bug that spans two functions.
