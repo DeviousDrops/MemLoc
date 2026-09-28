@@ -53,3 +53,63 @@ make format tidy
    I added a medium tier (32 KiB–1 MiB from the page heap). A direct mmap per
    allocation costs two syscalls plus a page fault per page, per malloc/free
    cycle.
+
+---
+
+## Phase 1: Single-threaded core allocator
+
+**Built**
+- `size_class.h`: 40 classes (D-1). `size_to_class` is arithmetic; the
+  class table and its invariants (16-byte multiples, no gaps, span tail
+  waste ≤ 1/16) are proved by `static_assert(classes_are_valid())`.
+- `chunk.h`: 4 MiB aligned chunks of 64 × 64 KiB units, span descriptors in
+  the chunk header, and a 1-bit-per-4 MiB chunk registry (D-2, D-3).
+- `page_heap.{h,cpp}`: first-fit run search over a 64-bit occupancy mask per
+  chunk; freeing a span clears bits, so coalescing is implicit.
+- `central.{h,cpp}`: per-class list of spans with free objects, lazy carving
+  (D-8), and empty spans returned to the page heap with one kept warm (D-12).
+- `huge.{h,cpp}`: direct mmap with a 64-byte header before the pointer,
+  `mremap` for realloc (D-11), and arbitrary alignment by padding (D-10).
+- `malloc.cpp`: `memloc_malloc/free/calloc/realloc/posix_memalign/aligned_alloc/malloc_usable_size`
+  with glibc semantics (D-9).
+
+**Results**
+- 27/27 tests pass with gcc 15.2, clang 21.1.8 and clang + UBSan
+  (`halt_on_error=1`). Format and clang-tidy are clean.
+  - `SizeClass.*`: exhaustive over every size 0…32768.
+  - `Api.*`, `Calloc.*`, `Realloc.*`, `Aligned.*`: boundary sizes around each
+    tier, `malloc(0)`, overflow, in-place realloc rules, every power-of-two
+    alignment from 8 B to 4 MiB, and EINVAL cases.
+  - `Stress.RandomAllocFreeReallocKeepsContents`: 300 000 random ops on 4 096
+    slots across all tiers, with a per-byte pattern verified before every free
+    and realloc. `Stress.ManySmallObjectsAreDistinct`: 200 000 live 16 B objects.
+- Measurement supporting D-4 (throwaway microbenchmark, 200 000 iterations,
+  3 runs): a 64 KiB alloc + touch every page + free cycle costs **41–58 ns**
+  through the medium tier versus **20.9–21.7 µs** with direct `mmap`/`munmap`
+  (≈ 400× slower), because each fresh mapping pays two syscalls and 16 page faults.
+
+**How to run**
+```sh
+make test
+ctest --test-dir ~/build/memloc -R Stress --output-on-failure
+```
+
+**Interview questions**
+1. *How does `free` distinguish a small object from a huge block?*
+   It tests the chunk-registry bit for `p >> 22`. Only chunks set bits, so a
+   clear bit means `p` came from a direct mmap, and its header is at `p - 64`.
+2. *Why is carving lazy?*
+   Writing a free list through a new 256 KiB span would fault in all 64 pages
+   up front. With a bump pointer, only pages that objects actually occupy
+   become resident.
+3. *How does `posix_memalign(4096, 100)` work without an offset header?*
+   Span bases are 64 KiB-aligned, so any class whose size is a multiple of
+   4096 yields page-aligned objects. The 4096 class is chosen, and `free`
+   needs no special case.
+4. *Why does `calloc` skip `memset` for huge blocks?*
+   They are fresh anonymous mappings, which the kernel guarantees are zero.
+   Zeroing them anyway would fault in every page immediately, turning a lazy
+   allocation into an eager one.
+5. *What is the cost of `realloc` growing a 100 MiB block?*
+   `mremap(MREMAP_MAYMOVE)`: the kernel re-points page-table entries, so no
+   bytes are copied. The header lives in the mapping and moves with it.
