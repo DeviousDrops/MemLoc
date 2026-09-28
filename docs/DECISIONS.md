@@ -144,7 +144,8 @@ Options:      A) per-thread arenas (glibc): each thread owns a whole heap,
 Choice:       B. Each thread has one singly-linked free list per class, with a
               count and a limit (2 × batch). A miss fetches a *batch* from the
               central list (one lock for up to 32 objects). A push past the
-              limit flushes a batch back. Batch size = clamp(64 KiB / size, 2, 32).
+              limit flushes a batch back. Batch size = clamp(64 KiB / size, 2, 32)
+              (upper bound raised to 128 after measurement, see D-17).
               The cache lives in `thread_local` storage with a trivial
               constructor and destructor (initial-exec TLS). A `pthread_key`
               destructor flushes it when the thread exits.
@@ -319,3 +320,160 @@ Trade-off:    Up to 40 idle spans (one per class, 64–256 KiB each) are held
 Interview Q:  "What is hysteresis in an allocator?" — Keeping a little slack
               (one empty span) so that a boundary oscillation doesn't turn into
               repeated expensive transitions.
+
+---
+
+## D-13: Central locking and lock ordering            (Phase 2)
+Context:      Central lists and the page heap are shared by all threads and
+              must be protected. Lock granularity decides both scalability and
+              deadlock risk.
+Options:      A) one global allocator lock
+              B) one mutex per size class plus one page-heap mutex, each
+                 central list padded to its own cache line
+              C) lock-free central lists (a CAS'd Treiber stack per class)
+Choice:       B. `struct alignas(64) CentralList { std::mutex mu; ... }`. The
+              only lock nesting is central[c] -> page heap, which happens when
+              a class needs a new span or returns an empty one. The page heap
+              never calls back into a central list, so no cycle, and so no
+              deadlock, is possible. Plain `std::mutex` (a futex): uncontended
+              lock/unlock is one atomic RMW each.
+Why:          Threads allocating different classes never touch the same lock
+              or cache line. Threads on the same class meet once per *batch*
+              (up to 32 objects), not once per object. `alignas(64)` stops two
+              hot neighbouring locks from sharing a line and ping-ponging
+              between cores (false sharing).
+Trade-off:    Growing the heap (mmap) happens under the page-heap lock and
+              briefly stalls other classes that need a span. Lock-free lists
+              (C) avoid convoying but bring ABA hazards with intrusive nodes,
+              and the brief lists them as a non-goal.
+Interview Q:  "How do you prove it can't deadlock?" - There is a global lock
+              order (central before page heap) and no code path acquires them
+              the other way round. Holding two central locks at once never
+              happens outside fork(), which takes them all in index order.
+
+## D-14: Thread-local storage model and thread-exit flush            (Phase 2)
+Context:      The thread cache must be reachable with no function call and no
+              allocation, including from inside malloc itself and before any
+              C++ initialiser has run. Its contents must go back to the central
+              lists when the thread exits.
+Options:      A) C++ `thread_local` object with a destructor
+              B) `pthread_getspecific` lookup on every call
+              C) trivially-constructible `constinit thread_local` in the
+                 initial-exec TLS model, plus a `pthread_key` whose destructor
+                 flushes the cache
+Choice:       C. Each thread's cache starts zeroed in the static TLS block
+              (state = Uninit). On its first slow path the thread registers
+              the key (`pthread_once` + `pthread_setspecific`, neither of which
+              allocates for the first 32 keys). At exit the key destructor
+              flushes every list and sets state = Dead. From then on, that
+              thread's malloc/free go straight to the central lists.
+Why:          A C++ `thread_local` destructor is registered via
+              `__cxa_thread_atexit_impl`, which calls `calloc`: malloc would
+              recurse into itself on every new thread. Initial-exec TLS
+              compiles to a `%fs`-relative load, while the default model for a
+              shared library (general-dynamic) calls `__tls_get_addr`, which
+              can itself allocate.
+Trade-off:    Initial-exec TLS in a shared library only works if the library
+              is loaded at startup (LD_PRELOAD or a link-time dependency).
+              `dlopen("libmemloc.so")` later may fail with "cannot allocate
+              memory in static TLS block". That is acceptable for a malloc
+              replacement. The Dead state costs a lock per operation for any
+              allocations made by other TSD destructors after ours.
+Interview Q:  "Why not use a thread_local with a destructor?" - Registering
+              that destructor calls calloc, and calloc is us. The pthread key
+              destructor path has no allocation, and initial-exec TLS avoids
+              `__tls_get_addr`.
+
+## D-15: Memory ordering            (Phase 2)
+Context:      Every piece of shared state needs a stated synchronisation
+              story. A data race is undefined behaviour even when the hardware
+              "happens to work", and ThreadSanitizer will flag it.
+Options:      A) seq_cst atomics everywhere; B) mutexes for all mutable shared
+              structures, with explicitly justified relaxed atomics for the
+              few lock-free reads
+Choice:       B.
+              - Central lists, span fields (`free_list`, `carve`, `live`,
+                `in_list`) and the page heap: only touched under their mutex,
+                which supplies acquire (lock) and release (unlock) ordering.
+              - Chunk registry: `fetch_or(relaxed)` under the page-heap lock,
+                `load(relaxed)` in `free`. The chunk bit is set before any
+                block of that chunk exists. Any thread that frees block p
+                obtained p through some happens-before chain from its
+                allocation, so the bit is visible (write->read coherence).
+              - `span->kind`, `size_class` and `owner[]`: written while the
+                span is created (under locks) and read unlocked in `free(p)`.
+                There is no race: they only change while the span is free, and
+                a free span contains no live block that could be passed to
+                `free`.
+              - The thread cache: owned by one thread and never read by another.
+Why:          Every cross-thread transfer of a block goes through a mutex
+              (central list) or through the user's own synchronisation, which
+              is where the happens-before edge must come from anyway.
+Trade-off:    Relaxed loads are only correct because of the argument above. A
+              future change that mutates `kind` or `owner[]` on a live span
+              would silently break it, so the reasoning is written next to the
+              code. seq_cst (A) would be easier to reason about, but costs a
+              full fence on every free on arm64.
+Interview Q:  "Why is a relaxed load of the registry bit enough in free()?" -
+              The bit was set before the chunk's first block was handed out,
+              and the freeing thread received the block through a
+              synchronising chain (at minimum the user's own). Happens-before
+              is transitive, so the store is visible.
+
+## D-16: Thread-cache limits (high-water mark)            (Phase 2)
+Context:      An unbounded cache lets a thread that frees heavily hoard memory
+              that other threads then have to allocate afresh.
+Options:      A) fixed per-class cap; B) a per-thread byte budget with
+              dynamic per-class caps (tcmalloc's "slow start"); C) no cache
+              for large classes
+Choice:       A. Cap = 2 x batch_size(class). When a push exceeds it, one
+              batch goes back to the central list, so the list settles
+              between batch and 2 x batch objects. Refill always fetches a
+              full batch.
+Why:          The hysteresis band of width `batch` means a thread oscillating
+              around the limit pays at most one lock per `batch` operations.
+              The worst-case cache is 2 x 64 KiB of objects per class
+              (about 5 MiB per thread if all 40 classes are saturated, in
+              practice far less).
+Trade-off:    Threads with very skewed size profiles would benefit from
+              larger caps on their hot classes and smaller ones elsewhere (B).
+              That needs per-thread tuning state and a stealing policy.
+Interview Q:  "What bounds memory held in thread caches?" - The per-class cap:
+              at most 2 batches per class per thread. Flushing on thread exit
+              returns everything.
+
+## D-17: Transfer cache and larger batches for tiny classes            (Phase 2)
+Context:      Added mid-phase after measuring. A throwaway probe (8 threads,
+              each allocating then freeing a working set of N 64-byte blocks)
+              ran at 24 M ops/s with the D-5/D-16 design, against 158 M for
+              glibc. At 1 thread MemLoc was 2-3x faster than glibc, so the
+              central lists were the bottleneck: every refill and every
+              release walked ~32 objects *under the class mutex*, and each of
+              those objects was a cache miss because another core wrote it last.
+Options:      A) shorten the critical section by moving whole batches
+                 (tcmalloc's transfer cache); B) shard each central list;
+              C) a lock-free central list (explicit non-goal)
+Choice:       A. Each central list keeps a stack of full batches, chained
+              through the second word of each batch's head object. A thread
+              releasing a full batch pushes it in O(1); a refill of a full
+              batch pops one in O(1). Only when that stack is empty (or holds
+              more than 1 MiB for the class) do objects go to or come from
+              spans. With O(1) critical sections the lock is paid per batch,
+              so the batch cap was raised from 32 to 128. A batch still holds
+              at most 64 KiB, so only classes below 512 B are affected.
+Why:          Measured on the same probe (M alloc+free pairs/s, 8 threads):
+              N=100: 25 -> 95 (transfer cache) -> 550-850 (cap 128);
+              N=1000: 24 -> 75 -> 265, where glibc gets 140-155.
+              The design is still "thread cache + central mutex" as
+              required. The change only shortens what happens while the mutex is held.
+Trade-off:    Up to 1 MiB per class can sit in the transfer cache, where it
+              cannot be returned to the spans (and so to the page heap for
+              other classes). Batches of 128 tiny objects make a thread's
+              cache up to 256 objects deep for those classes (at most
+              2 x 64 KiB per class, as before). Partial lists (thread-exit
+              flushes) still take the per-object span path.
+Interview Q:  "Your allocator was slower than glibc at 8 threads. How did you
+              find and fix it?" - Single-thread speed was fine, so the shared
+              part was suspect. The critical section touched every object
+              in the batch (a remote cache miss each). Moving whole batches
+              made it O(1), and then a bigger batch amortised the lock further.
