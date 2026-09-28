@@ -951,15 +951,22 @@ Interview Q:  "How did you find it?" - Bisect the workload, not the code:
 Context:      The realloc benchmark grows 64 buffers through the medium tier.
               realloc (D-11) moved a medium block whenever its unit count
               changed, even when the next units in the chunk were free.
-Choice:       `PageHeap::resize_span` grows a span into the free units right
+Options:      A) always allocate + copy + free; B) resize the span in place
+              when its neighbour is free, falling back to A.
+Choice:       B. `PageHeap::resize_span` grows a span into the free units right
               after it, or gives back its tail, under the page-heap lock.
               realloc tries it before moving a block that stays medium.
 Why:          It avoids an allocate + copy of up to 1 MiB per step whenever
               the neighbour is free. It is also what glibc does for its
               own chunks.
-Trade-off:    Measured effect on the benchmark is modest (median 61 → 62 ns
-              per call was within noise; best runs improved). It did *not*
+Trade-off:    Measured effect on the benchmark: the median over five full
+              runs went from 61 ns per call (63d0792) to 53 ns (3832b0c),
+              against 65 ns for mimalloc and 75 ns for glibc. It did *not*
               lower peak RSS. `MEMLOC_STATS=1` showed why: 28 chunks stay
               mapped with 95 MiB unused at exit, because freed medium spans
               are never returned to the OS (a README non-goal), and the final
               step of each buffer crosses 1 MiB into the huge tier.
+Interview Q:  "Your realloc is faster, so why is its peak RSS the highest?"
+              Speed comes from avoiding copies. Peak RSS comes from what
+              happens to freed spans: glibc trims and mremaps, MemLoc keeps
+              every chunk it ever mapped for reuse. Two separate knobs.
