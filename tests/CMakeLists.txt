@@ -43,3 +43,8 @@ if(NOT MEMLOC_SANITIZER)
 
   add_subdirectory(bugs)  # debug-mode bug suite, label "bugs" (D-27)
 endif()
+
+# LLM triage tool: offline unit tests with a mocked model (D-39).
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME triage_unit COMMAND Python3::Interpreter ${CMAKE_CURRENT_SOURCE_DIR}/triage/test_triage.py)
+set_tests_properties(triage_unit PROPERTIES LABELS triage TIMEOUT 60)
