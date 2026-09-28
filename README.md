@@ -10,8 +10,6 @@ It builds as:
 - `libmemloc_core.a`: the allocator, exposing `memloc_malloc`, `memloc_free`, … (used by tests)
 - `libmemloc.so`: a drop-in replacement that exports the whole malloc family, for `LD_PRELOAD`
 
-> Status: under construction. See [docs/PROGRESS.md](docs/PROGRESS.md).
-
 ## Architecture
 
 ```
