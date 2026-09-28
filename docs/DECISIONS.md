@@ -203,3 +203,119 @@ Trade-off:    Source reads over 9P slow the first compile. Option A is faster
 Interview Q:  "Why do your scripts care about line endings?" — A CRLF shebang
               line (`#!/bin/sh\r`) fails with "bad interpreter". `eol=lf` makes
               the checked-in bytes identical on every platform.
+
+---
+
+## D-8: Free-object representation and span carving            (Phase 1)
+Context:      A span must track which of its objects are free, cheaply, and
+              without touching memory the program has not used yet.
+Options:      A) per-span bitmap of free slots
+              B) intrusive singly-linked free list (the first 8 bytes of a free
+                 object point to the next one), threaded through the whole span
+                 when it is created
+              C) intrusive free list for *returned* objects, plus a bump
+                 pointer for never-used objects ("lazy carving")
+Choice:       C. `Span` holds `free_list` (recycled objects), `carve` (next
+              never-used object) and `limit` (end of the last whole object).
+              Allocation pops `free_list`, else bumps `carve`.
+Why:          Zero metadata per object, O(1) push and pop, and a fresh span
+              touches only the pages actually handed out. With option B,
+              creating a 256 KiB span would write to every page and fault it
+              in, even if the program only needs one object.
+Trade-off:    Intrusive lists are fragile: a use-after-free write corrupts the
+              `next` pointer and the damage shows up later as a wild pointer.
+              That is exactly what debug mode (Phase 4) exists to catch. A
+              bitmap (A) is immune to this and gives cheap "is this slot free?"
+              queries (useful for double-free detection), but costs a scan
+              per allocation.
+Interview Q:  "Where do you store the free list?" — Inside the free objects
+              themselves: a free block is dead memory, so its first word is
+              the `next` link. That is why the minimum class is 16 bytes
+              (at least one pointer, with 16-byte alignment).
+
+## D-9: Edge-case semantics of the malloc API            (Phase 1)
+Context:      Where the C standard is loose, drop-in replacement means matching
+              glibc, because real programs rely on glibc's behaviour.
+Options:      A) follow glibc everywhere; B) follow the letter of C23 (e.g.
+              `realloc(p, 0)` is undefined behaviour); C) mimic jemalloc/mimalloc
+Choice:       A.
+              - `malloc(0)` returns a unique 16-byte block.
+              - `realloc(p, 0)` frees `p` and returns NULL.
+              - `realloc(NULL, n)` behaves like `malloc(n)`.
+              - `calloc` checks `n*size` overflow → NULL + `ENOMEM`.
+              - Every failure sets `errno = ENOMEM`. `posix_memalign` returns an
+                error code and leaves `errno` untouched.
+              - `realloc` stays in place when the new size maps to the same
+                small class (or the same number of medium units), and moves
+                otherwise, including large shrinks, so a shrunk block never
+                pins a big one.
+Why:          Programs under LD_PRELOAD were written and tested against glibc.
+              Any difference is a latent bug that only shows up with our
+              allocator.
+Trade-off:    Freeing on `realloc(p, 0)` is exactly the case C23 made
+              undefined; a strictly portable program can't rely on it.
+              jemalloc returns a minimal block instead, which avoids the classic
+              "realloc returned NULL, so was p freed?" ambiguity.
+Interview Q:  "What does realloc(p, 0) do?" — In glibc (and here) it frees p
+              and returns NULL. Since C23 it is UB, precisely because
+              implementations disagreed.
+
+## D-10: Aligned allocation strategy            (Phase 1)
+Context:      `posix_memalign` and `aligned_alloc` can ask for any power-of-two
+              alignment, and the result must still be freeable by plain `free`.
+Options:      A) over-allocate `n + align` and store an offset before the
+                 pointer (breaks header-free small objects)
+              B) serve from a size class whose size is a multiple of `align`:
+                 span bases are 64 KiB-aligned, so every object in such a class
+                 is aligned. Medium spans are 64 KiB-aligned by construction.
+                 Anything else goes to the huge path, which can pad arbitrarily.
+Choice:       B. align ≤ 16 → plain malloc. align ≤ 32 KiB and n ≤ 32 KiB →
+              the smallest class ≥ max(n, align) that is a multiple of align.
+              align ≤ 64 KiB → a medium span. Larger → huge mmap, padded so
+              that the header still sits directly before the pointer.
+Why:          No new metadata and no special case in `free`: an aligned block
+              is an ordinary block.
+Trade-off:    `aligned_alloc(4096, 100)` uses a 4 KiB object (the price of a
+              page-aligned small allocation in any allocator). Very large
+              alignments waste up to `align` bytes of address space (not RSS)
+              in the huge path.
+Interview Q:  "How does free() know an aligned block was over-allocated?" —
+              It wasn't. Small aligned blocks come from classes whose size is
+              a multiple of the alignment, and huge blocks record their real
+              mapping base in the header before the pointer.
+
+## D-11: Huge-block realloc via mremap            (Phase 1)
+Context:      Growing a large buffer by repeated `realloc` (vectors, string
+              builders) is O(n²) bytes copied if every step copies.
+Options:      A) malloc + memcpy + free
+              B) `mremap(MREMAP_MAYMOVE)`: the kernel moves page-table entries
+                 and copies no data
+Choice:       B for huge → huge; A for any transition between tiers.
+Why:          The 64-byte header lives inside the same mapping, so it moves
+              with the data. Only the pointer offset from the mapping base
+              needs preserving, and it is.
+Trade-off:    Linux-specific (fine, D-7 non-goals). After a move, an alignment
+              above the page size is not preserved, but `realloc` never
+              promises more than fundamental alignment.
+Interview Q:  "How can realloc of a 100 MiB block be O(1)?" — `mremap`
+              relocates page-table entries, not bytes. Only the page tables
+              are touched.
+
+## D-12: When an empty span goes back to the page heap            (Phase 1)
+Context:      When the last live object of a small span is freed, the span can
+              either stay in its class or return to the page heap for any use.
+Options:      A) never return (memory stays bound to one class forever)
+              B) always return (alloc/free of one object can thrash span
+                 setup and teardown)
+              C) return unless it is the class's only span with free space
+Choice:       C.
+Why:          A workload that shifts from small to large objects can reuse
+              memory across classes (this matters for the fragmentation
+              benchmark), while a class that alternates between 0 and 1 live
+              objects keeps one warm span.
+Trade-off:    Up to 40 idle spans (one per class, 64–256 KiB each) are held
+              forever. A time-based decay (jemalloc) is smarter, but needs a
+              clock and a background purge.
+Interview Q:  "What is hysteresis in an allocator?" — Keeping a little slack
+              (one empty span) so that a boundary oscillation doesn't turn into
+              repeated expensive transitions.
