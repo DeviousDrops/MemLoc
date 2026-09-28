@@ -3,7 +3,7 @@ BUILD ?= $(HOME)/build/memloc
 TSAN_BUILD ?= $(HOME)/build/memloc-tsan
 GEN := $(shell command -v ninja >/dev/null && echo -G Ninja)
 
-.PHONY: all build test bugs tsan format format-fix tidy clean
+.PHONY: all build test bugs bench plots tsan format format-fix tidy clean
 
 all: test
 
@@ -18,6 +18,14 @@ test: build
 bugs: build
 	tools/run_bugs.py --lib $(BUILD)/src/libmemloc.so --bin-dir $(BUILD)/tests/bugs \
 	  --keep $(BUILD)/bug-reports
+
+# Full benchmark run (~15 min): glibc vs mimalloc vs MemLoc, then the graphs.
+bench: build
+	tools/bench.py --build $(BUILD)
+	tools/plot_bench.py --table
+
+plots:
+	tools/plot_bench.py --table
 
 tsan:
 	cmake -S . -B $(TSAN_BUILD) $(GEN) -DCMAKE_BUILD_TYPE=RelWithDebInfo \
