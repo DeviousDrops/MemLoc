@@ -2,6 +2,11 @@
 # Tests link this directly, so sanitizers see our code rather than an
 # interposed malloc.
 add_library(memloc_core STATIC
+  central.cpp
+  huge.cpp
+  malloc.cpp
+  os.cpp
+  page_heap.cpp
   version.cpp
 )
 target_include_directories(memloc_core

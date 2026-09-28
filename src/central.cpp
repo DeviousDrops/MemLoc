@@ -1,0 +1,82 @@
+#include "central.h"
+
+#include "page_heap.h"
+
+namespace memloc {
+
+constinit CentralList g_central[kNumClasses];
+
+void CentralList::link(Span* s) {
+  s->prev = nullptr;
+  s->next = spans_;
+  if (spans_ != nullptr) spans_->prev = s;
+  spans_ = s;
+  s->in_list = true;
+}
+
+void CentralList::unlink(Span* s) {
+  if (s->prev != nullptr) {
+    s->prev->next = s->next;
+  } else {
+    spans_ = s->next;
+  }
+  if (s->next != nullptr) s->next->prev = s->prev;
+  s->prev = s->next = nullptr;
+  s->in_list = false;
+}
+
+unsigned CentralList::fetch(unsigned cls, unsigned n, void** head) {
+  const std::size_t size = class_size(cls);
+  void* list = nullptr;
+  unsigned got = 0;
+  while (got < n) {
+    Span* s = spans_;
+    if (s == nullptr) {
+      s = g_page_heap.alloc_span(span_units(cls));
+      if (s == nullptr) break;
+      s->kind = SpanKind::kSmall;
+      s->size_class = static_cast<std::uint8_t>(cls);
+      s->carve = span_base(s);
+      s->limit = s->carve + objects_per_span(cls) * size;
+      link(s);
+    }
+    // Drain this span as far as the request allows.
+    while (got < n) {
+      void* obj = s->free_list;
+      if (obj != nullptr) {
+        s->free_list = next_of(obj);
+      } else if (s->carve < s->limit) {
+        obj = s->carve;
+        s->carve += size;
+      } else {
+        break;
+      }
+      next_of(obj) = list;
+      list = obj;
+      ++s->live;
+      ++got;
+    }
+    if (s->free_list == nullptr && s->carve == s->limit) unlink(s);  // exhausted
+  }
+  *head = list;
+  return got;
+}
+
+void CentralList::release(void* head) {
+  while (head != nullptr) {
+    void* obj = head;
+    head = next_of(obj);
+    Span* s = span_of(obj);
+    next_of(obj) = s->free_list;
+    s->free_list = obj;
+    --s->live;
+    if (!s->in_list) link(s);
+    const bool only_span = spans_ == s && s->next == nullptr;
+    if (s->live == 0 && !only_span) {
+      unlink(s);
+      g_page_heap.free_span(s);
+    }
+  }
+}
+
+}  // namespace memloc
