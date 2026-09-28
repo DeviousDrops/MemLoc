@@ -3,14 +3,22 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdint>
 
 namespace memloc {
 
 std::size_t os_page_size() {
   // getpagesize() is async-signal-safe and does not allocate. On arm64 it can
-  // be 4, 16 or 64 KiB, all of which divide our 64 KiB unit.
-  static const auto page = static_cast<std::size_t>(getpagesize());
+  // be 4, 16 or 64 KiB, all of which divide our 64 KiB unit. A racy but
+  // idempotent cache, because a function-local static would need
+  // __cxa_guard_acquire from libstdc++.
+  static constinit std::atomic<std::size_t> cached{0};
+  std::size_t page = cached.load(std::memory_order_relaxed);
+  if (page == 0) {
+    page = static_cast<std::size_t>(getpagesize());
+    cached.store(page, std::memory_order_relaxed);
+  }
   return page;
 }
 

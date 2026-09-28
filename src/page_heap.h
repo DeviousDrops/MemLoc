@@ -22,9 +22,10 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <mutex>
+#include <mutex>  // std::scoped_lock
 
 #include "chunk.h"
+#include "mutex.h"
 
 namespace memloc {
 
@@ -44,6 +45,10 @@ class PageHeap {
   Span* alloc_span(unsigned units);
   void free_span(Span* s);
 
+  // fork() support (D-20): hold the heap's lock across fork.
+  void lock() { mu_.lock(); }
+  void unlock() { mu_.unlock(); }
+
   std::size_t mapped_bytes() const {
     return chunk_count_.load(std::memory_order_relaxed) * kChunkSize;
   }
@@ -51,7 +56,7 @@ class PageHeap {
  private:
   Chunk* grow();
 
-  std::mutex mu_;
+  Mutex mu_;
   Chunk* first_ = nullptr;                   // guarded by mu_
   Chunk* last_ = nullptr;                    // guarded by mu_
   std::atomic<std::size_t> chunk_count_{0};  // written under mu_, read anywhere

@@ -15,6 +15,7 @@
 #include <cstring>
 
 #include "config.h"
+#include "fork.h"
 #include "huge.h"
 #include "memloc/memloc.h"
 #include "page_heap.h"
@@ -33,6 +34,7 @@ unsigned medium_units(std::size_t n) {
 }
 
 void* medium_alloc(std::size_t n) {
+  install_fork_handlers();  // small allocations do this on cache activation
   Span* s = g_page_heap.alloc_span(medium_units(n));
   if (s == nullptr) {
     errno = ENOMEM;

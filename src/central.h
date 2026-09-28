@@ -30,9 +30,10 @@
 // take the page-heap lock while holding this one (order: central -> page heap).
 #pragma once
 
-#include <mutex>
+#include <mutex>  // std::scoped_lock
 
 #include "chunk.h"
+#include "mutex.h"
 #include "size_class.h"
 
 namespace memloc {
@@ -51,6 +52,10 @@ class alignas(64) CentralList {
   // Same, for a list of exactly batch_size(cls) objects.
   void release_batch(unsigned cls, void* head);
 
+  // fork() support (D-20): hold the list's lock across fork.
+  void lock() { mu_.lock(); }
+  void unlock() { mu_.unlock(); }
+
   // Test hook: number of batches in the transfer cache.
   unsigned cached_batches();
 
@@ -62,7 +67,7 @@ class alignas(64) CentralList {
   void link(Span* s);
   void unlink(Span* s);
 
-  std::mutex mu_;
+  Mutex mu_;
   void* batches_ = nullptr;   // guarded by mu_
   unsigned num_batches_ = 0;  // guarded by mu_
   Span* spans_ = nullptr;     // guarded by mu_

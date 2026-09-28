@@ -6,6 +6,7 @@
 #include <cstdint>
 
 #include "central.h"
+#include "fork.h"
 #include "size_class.h"
 
 namespace memloc {
@@ -53,6 +54,7 @@ void activate(ThreadCache& tc) {
   tc.state = TcState::kActive;
   pthread_once(&g_exit_key_once, create_exit_key);
   pthread_setspecific(g_exit_key, &tc);
+  install_fork_handlers();
 }
 
 __attribute__((noinline)) void* refill(unsigned cls) {

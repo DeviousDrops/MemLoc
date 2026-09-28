@@ -524,19 +524,20 @@ Context:      A preloaded malloc runs before any constructor, and possibly
 Options:      A) dlsym plus a static bump-allocator for the recursive calls;
               B) make the allocator usable with zero initialisation code
 Choice:       B. Every piece of global state is `constinit`: the chunk
-              registry, page heap, central lists and their mutexes (glibc's
-              `PTHREAD_MUTEX_INITIALIZER` is all zeros, so `std::mutex` is
-              constexpr-constructible), plus the thread caches (zero-filled
-              static TLS). The only lazy step is per-thread cache activation,
+              registry, page heap, central lists and their mutexes (a small
+              `Mutex` wrapper over `pthread_mutex_t` with
+              `PTHREAD_MUTEX_INITIALIZER`), plus the thread caches
+              (zero-filled static TLS). `std::mutex` was used until this
+              phase. It is constexpr too, but its `lock()` throws on error,
+              which pulled libstdc++'s exception runtime into
+              libmemloc.so. The only lazy step is per-thread cache activation,
               which is recursion-safe (D-14). MemLoc never calls dlsym. On
               the allocation path, the only calls that could reach malloc are
               `pthread_key_create`, `pthread_setspecific` and `pthread_atfork`,
               and they run only during activation.
 Why:          There is no "not yet initialised" state, so there is no
               window where a call can observe one.
-Trade-off:    Relies on `std::mutex` being constexpr (true for libstdc++ and
-              libc++ on Linux), and on the preloaded object's TLS being
-              static (true for LD_PRELOAD; `dlopen`ing libmemloc.so later is
+Trade-off:    Relies on the preloaded object's TLS being static (true for LD_PRELOAD; `dlopen`ing libmemloc.so later is
               unsupported).
 Interview Q:  "Why is dlsym dangerous inside malloc?" - dlsym can allocate
               (calloc for its thread-local error buffer), so the first call
