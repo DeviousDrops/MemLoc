@@ -1,0 +1,14 @@
+{
+  "date": "2026-09-28",
+  "cpu": "13th Gen Intel(R) Core(TM) i7-13700H",
+  "logical_cpus": 20,
+  "cores_per_socket": "10",
+  "threads_per_core": "2",
+  "memory_gib": 7.6,
+  "kernel": "6.18.33.2-microsoft-standard-WSL2",
+  "wsl": true,
+  "glibc": "2.43",
+  "compiler": "c++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+  "mimalloc": "/usr/lib/x86_64-linux-gnu/libmimalloc.so.3.2",
+  "memloc_commit": "3832b0c"
+}
