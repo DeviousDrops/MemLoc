@@ -1,0 +1,54 @@
+// page_heap.h - hands out spans (runs of 64 KiB units) from 4 MiB chunks. (D-3)
+//
+// Each chunk's free units are the zero bits of chunk->used. To find k
+// contiguous free units, AND the free mask with shifted copies of itself:
+//
+//   free          = 1111 0011 1100 0000   (bit j set = unit j free)
+//   free>>1       = 0111 1001 1110 0000
+//   free>>2       = 0011 1100 1111 0000
+//   k=3: m = free & free>>1 & free>>2 = 0011 0000 1100 0000
+//   bit j of m is set iff units j..j+2 are all free; first fit = ctz(m)
+//
+// Freeing a span clears its bits, so it merges with free neighbours for free
+// (no coalescing code at all). Chunks are appended to a list and searched
+// first-fit from the oldest, which packs the heap toward low addresses.
+// Chunks are never unmapped: returning memory to the OS is a non-goal.
+#pragma once
+
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+
+#include "chunk.h"
+
+namespace memloc {
+
+// Index of the lowest run of k consecutive set bits in free_mask, or -1.
+constexpr int find_free_run(std::uint64_t free_mask, unsigned k) {
+  std::uint64_t m = free_mask;
+  for (unsigned i = 1; i < k && m != 0; ++i) m &= free_mask >> i;
+  return m == 0 ? -1 : std::countr_zero(m);
+}
+
+class PageHeap {
+ public:
+  constexpr PageHeap() = default;
+
+  // Returns a span of `units` contiguous units with kind, size_class and all
+  // list fields zeroed, or nullptr if the OS refuses more memory.
+  Span* alloc_span(unsigned units);
+  void free_span(Span* s);
+
+  std::size_t mapped_bytes() const { return chunk_count_ * kChunkSize; }
+
+ private:
+  Chunk* grow();
+
+  Chunk* first_ = nullptr;
+  Chunk* last_ = nullptr;
+  std::size_t chunk_count_ = 0;
+};
+
+extern PageHeap g_page_heap;
+
+}  // namespace memloc
