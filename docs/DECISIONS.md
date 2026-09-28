@@ -477,3 +477,120 @@ Interview Q:  "Your allocator was slower than glibc at 8 threads. How did you
               part was suspect. The critical section touched every object
               in the batch (a remote cache miss each). Moving whole batches
               made it O(1), and then a bigger batch amortised the lock further.
+
+## D-18: How libmemloc.so replaces glibc malloc            (Phase 3)
+Context:      With `LD_PRELOAD`, the dynamic linker searches the preloaded
+              object right after the executable and before libc.so.6, so its
+              definition of `malloc` wins every lookup (including glibc's own
+              internal calls, which go through the PLT for exactly this
+              purpose).
+Options:      A) define the full malloc family ourselves; B) wrap glibc: define
+              `malloc` and forward to the real one via `dlsym(RTLD_NEXT)`
+              (only useful for tracing); C) glibc's `__malloc_hook` (removed
+              in glibc 2.34)
+Choice:       A. `src/preload.cpp` defines every function the glibc manual
+              ("Replacing malloc") lists: malloc, free, calloc, realloc, and
+              also aligned_alloc, malloc_usable_size, memalign,
+              posix_memalign, pvalloc and valloc, plus reallocarray. All are
+              thin wrappers over the memloc_* functions. The shared library
+              is compiled with `-fvisibility=hidden`, so only those names and
+              the memloc_* API are exported. It is linked with
+              `-Bsymbolic-functions`, so internal calls never go through
+              the PLT, and without libstdc++, so a C program such as sqlite3
+              does not pull it in.
+              C++ `operator new/delete` are not redefined: libstdc++'s
+              versions call malloc/free/aligned_alloc, which are ours.
+Why:          Missing even one family member is a classic crash. For
+              example, a block from glibc's `memalign` reaching our `free`.
+              A pointer we did not allocate is detected (bad huge-header
+              magic) and aborts with a message, like glibc's "free(): invalid
+              pointer".
+Trade-off:    glibc-specific introspection (`mallinfo2`, `malloc_stats`,
+              `malloc_trim`, `mallopt`) still reaches glibc's own, unused
+              arena and reports nothing useful. That is harmless, and
+              documented as a limitation.
+Interview Q:  "What happens if you interpose malloc and free but not
+              posix_memalign?" - glibc's posix_memalign returns a glibc block,
+              and the program later passes it to your free. At best that is
+              an invalid-pointer abort. At worst it corrupts your heap.
+
+## D-19: Bootstrap without dlsym            (Phase 3)
+Context:      A preloaded malloc runs before any constructor, and possibly
+              before libc has finished initialising. The classic trap: a
+              wrapper-style malloc calls `dlsym(RTLD_NEXT, "malloc")` on
+              first use, and dlsym itself calls `calloc` for its error state.
+              That re-enters the wrapper before the pointer is set, so the
+              program recurses infinitely or needs a static bootstrap buffer.
+Options:      A) dlsym plus a static bump-allocator for the recursive calls;
+              B) make the allocator usable with zero initialisation code
+Choice:       B. Every piece of global state is `constinit`: the chunk
+              registry, page heap, central lists and their mutexes (glibc's
+              `PTHREAD_MUTEX_INITIALIZER` is all zeros, so `std::mutex` is
+              constexpr-constructible), plus the thread caches (zero-filled
+              static TLS). The only lazy step is per-thread cache activation,
+              which is recursion-safe (D-14). MemLoc never calls dlsym. On
+              the allocation path, the only calls that could reach malloc are
+              `pthread_key_create`, `pthread_setspecific` and `pthread_atfork`,
+              and they run only during activation.
+Why:          There is no "not yet initialised" state, so there is no
+              window where a call can observe one.
+Trade-off:    Relies on `std::mutex` being constexpr (true for libstdc++ and
+              libc++ on Linux), and on the preloaded object's TLS being
+              static (true for LD_PRELOAD; `dlopen`ing libmemloc.so later is
+              unsupported).
+Interview Q:  "Why is dlsym dangerous inside malloc?" - dlsym can allocate
+              (calloc for its thread-local error buffer), so the first call
+              recurses into your malloc before the real-malloc pointer is
+              known.
+
+## D-20: fork() safety            (Phase 3)
+Context:      fork() copies only the calling thread. If another thread held a
+              central or page-heap mutex at that moment, the child inherits a
+              lock nobody will ever release, and its next malloc deadlocks.
+              Python's `multiprocessing` (fork start method) hits this in
+              practice.
+Options:      A) `pthread_atfork` handlers that take every allocator lock
+              before fork and release them in both processes afterwards;
+              B) re-initialise the locks in the child (undefined behaviour for
+              a mutex locked by another thread)
+Choice:       A. The prepare handler locks all 40 central mutexes in index
+              order and then the page-heap mutex, which respects the
+              central -> page heap order (D-13). The parent and child
+              handlers unlock in reverse. The handlers are registered once,
+              on the first thread-cache activation, so the static library
+              used by tests gets them too.
+Why:          It is the standard solution (glibc's own malloc does the
+              same). Because fork happens with every lock held by the forking
+              thread, the child's heap is consistent.
+Trade-off:    Objects sitting in *other* threads' caches are unreachable in
+              the child, a bounded leak (at most 2 batches per class per
+              thread). fork() also becomes slightly slower (41 lock
+              operations).
+Interview Q:  "Why must the prepare handler respect the lock order?" - It
+              runs while other threads are still allocating. Taking locks
+              out of order could deadlock against a thread holding a central
+              lock and waiting for the page heap.
+
+## D-21: Verifying the drop-in            (Phase 3)
+Context:      "It didn't crash" is weak evidence. A preload that silently
+              failed to load would pass every test.
+Options:      A) trust LD_PRELOAD; B) assert interposition explicitly
+Choice:       B. `memloc_preload_tests` (GoogleTest, not linked against
+              memloc_core) first checks with `dladdr(&malloc)` that malloc
+              resolves into libmemloc.so, then exercises every family member,
+              C++ new/delete (including over-aligned new), threads and
+              fork-while-allocating. `tools/preload_demo.sh` runs a sqlite3
+              and a python3 workload with and without the preload,
+              diffs their outputs, and checks from `LD_DEBUG=bindings` that
+              the program's own malloc binds to libmemloc.so. Both run under
+              ctest with the label `preload` and are skipped in sanitizer
+              builds (sanitizers interpose malloc themselves).
+Why:          Every claim ("sqlite3 runs on MemLoc") is backed by a check
+              that would fail if it were not true.
+Trade-off:    The demo depends on sqlite3 and python3 being installed. When
+              either is missing, the corresponding step is skipped with a
+              message.
+Interview Q:  "How do you prove the program actually used your allocator?" -
+              Ask the dynamic linker. `dladdr` on the resolved malloc
+              address names the defining object, and `LD_DEBUG=bindings`
+              logs each symbol binding.
