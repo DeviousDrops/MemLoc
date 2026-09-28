@@ -1,0 +1,25 @@
+# Lint profile: catch real bugs and performance mistakes; skip checks that fight
+# an allocator's unavoidable pointer arithmetic and casts.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-reserved-identifier,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  performance-*,
+  modernize-*,
+  -modernize-use-trailing-return-type,
+  -modernize-avoid-c-arrays,
+  -modernize-use-nodiscard,
+  -modernize-macro-to-enum,
+  readability-braces-around-statements,
+  readability-const-return-type,
+  readability-redundant-*,
+  readability-misleading-indentation,
+  misc-unused-parameters,
+  misc-definitions-in-headers
+WarningsAsErrors: '*'
+HeaderFilterRegex: '(src|include)/.*'
+CheckOptions:
+  - key: readability-braces-around-statements.ShortStatementLines
+    value: 1
