@@ -1,5 +1,7 @@
 # Lint profile: catch real bugs and performance mistakes; skip checks that fight
 # an allocator's unavoidable pointer arithmetic and casts.
+# -performance-no-int-to-ptr: an allocator must turn addresses into pointers
+# (p & ~mask); the check would flag the core lookup on every free.
 Checks: >
   -*,
   bugprone-*,
@@ -7,6 +9,7 @@ Checks: >
   -bugprone-reserved-identifier,
   -bugprone-multi-level-implicit-pointer-conversion,
   performance-*,
+  -performance-no-int-to-ptr,
   modernize-*,
   -modernize-use-trailing-return-type,
   -modernize-avoid-c-arrays,
