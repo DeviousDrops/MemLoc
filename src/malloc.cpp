@@ -201,7 +201,14 @@ void* memloc_realloc(void* ptr, size_t size) {
     return nullptr;
   }
   if (in_chunk(ptr)) {
-    if (fits_in_place(span_of(ptr), size)) return ptr;
+    Span* s = span_of(ptr);
+    if (fits_in_place(s, size)) return ptr;
+    // A medium block staying medium can often grow into the free units
+    // right after it (or give back its tail) instead of moving.
+    if (s->kind == SpanKind::kMedium && size > kMaxSmall && size <= kMaxMedium &&
+        g_page_heap.resize_span(s, medium_units(size))) {
+      return ptr;
+    }
   } else if (size > kMaxMedium) {
     return huge_realloc(ptr, size);  // mremap: no copy. D-11
   }

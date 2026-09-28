@@ -78,4 +78,21 @@ void PageHeap::free_span(Span* s) {
   c->used &= ~run_mask(u, s->units);
 }
 
+bool PageHeap::resize_span(Span* s, unsigned units) {
+  const std::scoped_lock lock(mu_);
+  Chunk* c = chunk_of(s);
+  const auto u = static_cast<unsigned>(s - c->spans);
+  if (units < s->units) {
+    c->used &= ~run_mask(u + units, s->units - units);
+  } else if (units > s->units) {
+    if (u + units > kUnitsPerChunk) return false;
+    const std::uint64_t extra = run_mask(u + s->units, units - s->units);
+    if ((c->used & extra) != 0) return false;
+    c->used |= extra;
+    std::memset(&c->owner[u + s->units], static_cast<int>(u), units - s->units);
+  }
+  s->units = static_cast<std::uint8_t>(units);
+  return true;
+}
+
 }  // namespace memloc

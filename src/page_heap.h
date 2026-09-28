@@ -46,6 +46,11 @@ class PageHeap {
   Span* alloc_span(unsigned units, SpanKind kind);
   void free_span(Span* s);
 
+  // Grows or shrinks a span in place to `units`. Growing needs the units just
+  // after it in the same chunk to be free. Returns false (changing nothing)
+  // when they are not. Used by realloc on medium blocks.
+  bool resize_span(Span* s, unsigned units);
+
   // fork() support (D-20): hold the heap's lock across fork.
   void lock() { mu_.lock(); }
   void unlock() { mu_.unlock(); }

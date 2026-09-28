@@ -133,6 +133,17 @@ TEST(Realloc, StaysInPlaceWithinTheSameMediumUnits) {
   memloc_free(p);
 }
 
+TEST(Realloc, MediumBlockShrinksAndRegrowsInPlace) {
+  void* p = memloc_malloc(700 * 1024);  // 11 units
+  fill(p, 70 * 1024, 5);
+  EXPECT_EQ(memloc_realloc(p, 70 * 1024), p);  // gives back its tail
+  EXPECT_EQ(memloc_malloc_usable_size(p), 128u * 1024);
+  EXPECT_EQ(memloc_realloc(p, 700 * 1024), p);  // the tail is still free
+  EXPECT_EQ(memloc_malloc_usable_size(p), 704u * 1024);
+  EXPECT_TRUE(check(p, 70 * 1024, 5));
+  memloc_free(p);
+}
+
 TEST(Realloc, PreservesContentsAcrossEveryTier) {
   // Grow through small -> medium -> huge, then shrink back down.
   std::vector<std::size_t> steps = {1,        24,       200,    5000,  40000, 300000, 2u << 20,
