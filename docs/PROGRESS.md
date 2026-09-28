@@ -384,3 +384,80 @@ ctest --test-dir ~/build/memloc -L bugs --output-on-failure
    if its innermost frame is in the dynamic loader, if any frame is
    `_IO_file_doallocate` (the stdio buffer), or if no frame is outside
    system libraries.
+
+## Phase 5: Statistics and benchmarks
+
+**Built**
+- `memloc_stats()` / `memloc_stats_print(fd)` and `MEMLOC_STATS=1` (D-28,
+  D-29). A snapshot takes every central lock, then the page-heap lock (the
+  fork order), and walks all chunks. Only mapping (os.cpp) and huge blocks
+  (huge.cpp) keep atomic counters, and the fast path counts nothing.
+  `os_map_aligned` now accounts only the window it keeps, which removed a
+  4 MiB inflation of the peak.
+- Four benchmarks in `bench/` (D-31): larson (16-256 B, arrays passed
+  between threads), random (log-uniform 8 B-32 KiB, window of 256), rss
+  (fill 256 MiB, free half, refill 128 MiB of 1-4 KiB) and realloc growth
+  (64 buffers to 1 MiB in 1-64 B steps). They call plain `malloc` and are
+  built with `-fno-builtin`.
+- `tools/bench.py` picks the allocator with `LD_PRELOAD` (D-30). Runs are
+  the outer loop so drift hits all three alike. It writes
+  `bench/results/results.csv` and `machine.json`. `tools/plot_bench.py`
+  draws `docs/img/*.png` and prints median tables (D-32). The graphs use a
+  colour-vision-checked palette and label lines directly.
+- Two optimisations found by the benchmarks:
+  - D-33: a 65-entry size-class lookup table up to 1 KiB. Mixed 16-256 B
+    went from 71 to 110 Mops/s (a branch mispredict at the 128 B boundary).
+  - D-34: realloc resizes medium spans in place (`PageHeap::resize_span`).
+- `bench_smoke_*` ctests run every benchmark once under MemLoc.
+
+**Results** (i7-13700H, 20 logical CPUs, WSL2 6.18, glibc 2.43, mimalloc
+3.2.8, MemLoc 3832b0c, median of 5 runs; full tables in the README)
+- Larson M ops/s, MemLoc / mimalloc / glibc: 1 thread 104 / 134 / 77,
+  4 threads 260 / 244 / 93, 16 threads 359 / 376 / 187.
+- Random M ops/s: 1 thread 71 / 53 / 17, 4 threads 231 / 166 / 55,
+  16 threads 383 / 382 / 103.
+- RSS / live after refill: 1.32 / 1.59 / 1.02 (1 thread) and
+  1.35 / 1.63 / 1.02 (4 threads).
+- realloc growth: 53 / 65 / 75 ns per call, and peak RSS 170 / 131 / 71 MiB.
+  Before D-34 the full run gave 61 ns for MemLoc.
+- The first full run (before D-34) differed from this one by up to 18 %
+  at the same thread count (larson at 2 threads: 150 vs 177). That is the
+  run-to-run noise of this machine, and why medians and bands are shown.
+- ctest: gcc 63/63 (41 unit, 7 preload, 11 bugs, 4 bench smoke), clang
+  59/59 (built without benchmarks), TSan 41/41. clang-format and clang-tidy
+  are clean.
+
+**How to run**
+```sh
+make bench                      # build, 5 runs x 3 allocators (~2 min), plots + tables
+make plots                      # redraw docs/img from bench/results
+tools/bench.py --runs 1 --threads 1 4 --out /tmp/quick
+MEMLOC_STATS=1 LD_PRELOAD=~/build/memloc/src/libmemloc.so python3 -c 'print(1)'
+```
+
+**Interview questions**
+1. *Why walk the heap for statistics instead of keeping counters?* Counters
+   on the fast path cost every allocation, and per-thread counters still
+   need summing. Statistics are rare, so the snapshot pays instead: it
+   locks the central lists and page heap and walks the chunks. Blocks
+   sitting in thread caches count as allocated, as the header documents.
+2. *How did you find the 1-thread larson slowdown?* By bisecting the
+   workload, not the code. Single sizes were fast, and so was a mix below
+   128 B. A mix across 128 B was slow at any working-set size. That points
+   to a data-dependent branch, and the class computation was the only one.
+   A lookup table made it +55 %.
+3. *Your peak RSS numbers were identical for every allocator. Why?*
+   `getrusage(RUSAGE_SELF).ru_maxrss` survives `exec`, so it reported the
+   Python driver's peak. Reading `VmHWM` from `/proc/self/status` gives
+   the benchmark's own high-water mark.
+4. *How do you make an allocator comparison fair?* Use the same binary for
+   all three via `LD_PRELOAD`, with `-fno-builtin` so the compiler can't
+   drop malloc/free pairs. Interleave allocators within each run, repeat 5
+   times, report the median with the min-max band, and publish the machine
+   details.
+5. *Why is your RSS worse than glibc after refill?* A small span holds one
+   size class. The freed half leaves most spans partly used, and those
+   holes can only take blocks of the same class. glibc coalesces free
+   chunks of any size and splits them for the 1-4 KiB refill. Fixing this
+   would need the span to be empty (it is then returned to the page heap)
+   or a way to return pages to the OS (`madvise`), which is a non-goal.

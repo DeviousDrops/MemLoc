@@ -105,6 +105,108 @@ symbolizer turns them into this:
 Debug mode is slow on purpose: sqlite3 runs about 4× slower and python3
 about 2.3× slower (see [PROGRESS](docs/PROGRESS.md#phase-4-debug-mode)).
 
+## Statistics
+
+`memloc_stats()` fills a `struct memloc_stats` (declared in
+[memloc.h](include/memloc/memloc.h)) with the bytes mapped from the OS, the
+peak mapping, bytes allocated per tier, and the free space inside small spans
+and chunks. `memloc_stats_print(fd)` writes the same data plus one row per
+size class. The allocation fast path keeps no counters. Instead, a snapshot
+walks every chunk while holding the allocator's locks ([D-28](docs/DECISIONS.md)).
+
+`MEMLOC_STATS=1` prints the report to stderr at exit ([D-29](docs/DECISIONS.md)).
+Here it is for a python3 script that builds and serialises a 200k-element list:
+
+```
+$ MEMLOC_STATS=1 LD_PRELOAD=~/build/memloc/src/libmemloc.so python3 -c '...'
+memloc stats (pid 442)
+  mapped from OS     8.00 MiB
+  peak mapped        42.71 MiB
+  allocated          2.45 MiB
+    small            2.08 MiB
+    medium           0.38 MiB
+    huge             0.00 MiB
+  small span space   4.44 MiB
+  unused chunk space 3.06 MiB
+  chunks 2, huge blocks 0
+  class  block B  spans  span KiB  blocks out  used %
+      0       16      1        64         128       3
+      1       32      1        64         256      12
+  ...
+     16      640      2       128         204      99
+  ...
+     39    32768      1       256           2      25
+```
+
+The peak is much higher than the final mapping because the list's large
+arrays were huge blocks, which go back to the OS as soon as they are freed.
+
+## Performance
+
+MemLoc is compared with glibc 2.43 and mimalloc 3.2.8. Each allocator is
+loaded with `LD_PRELOAD` into the same benchmark binaries, and every
+configuration runs 5 times. The graphs show the median, and the throughput
+bands span the fastest and slowest run. The methodology is in
+[D-30 to D-32](docs/DECISIONS.md), the raw data is in
+[bench/results](bench/results), and `make bench` reproduces everything
+(about 2 minutes).
+
+Machine: Intel i7-13700H (20 logical CPUs), 7.6 GiB, Linux 6.18 under WSL2,
+gcc 15.2, MemLoc at commit 3832b0c. WSL2 and a laptop CPU with mixed P/E cores
+make these numbers noisier than a dedicated server would be.
+
+![Throughput: larson and random-size workloads, 1-16 threads](docs/img/throughput.png)
+
+| threads | larson: MemLoc | mimalloc | glibc | random: MemLoc | mimalloc | glibc |
+|---|---|---|---|---|---|---|
+| 1 | 104 | **134** | 77 | **71** | 53 | 17 |
+| 2 | **177** | 156 | 71 | **135** | 95 | 31 |
+| 4 | **260** | 244 | 93 | **231** | 166 | 55 |
+| 8 | **302** | 269 | 130 | **331** | 247 | 86 |
+| 16 | 359 | **376** | 187 | **383** | 382 | 103 |
+
+<sub>Million operations per second, median of 5 runs. Larson: 16-256 B blocks
+freed by a different thread than the one that allocated them. Random: sizes
+log-uniform from 8 B to 32 KiB, with a sliding window of 256 live blocks per
+thread.</sub>
+
+![RSS divided by live bytes after fill, free-half and refill phases](docs/img/rss.png)
+
+| phase | 1 thread: MemLoc | mimalloc | glibc | 4 threads: MemLoc | mimalloc | glibc |
+|---|---|---|---|---|---|---|
+| fill 256 MiB | 1.07 | 1.08 | **1.00** | 1.08 | 1.08 | **1.00** |
+| free half | 2.08 | 2.09 | **1.95** | 2.21 | 2.20 | **2.05** |
+| refill 128 MiB | 1.32 | 1.59 | **1.02** | 1.35 | 1.63 | **1.02** |
+
+![realloc growth: time per call and peak RSS](docs/img/realloc.png)
+
+| realloc growth (64 buffers to 1 MiB) | MemLoc | mimalloc | glibc |
+|---|---|---|---|
+| time per call | **53 ns** | 65 ns | 75 ns |
+| peak RSS | 170 MiB | 131 MiB | **71 MiB** |
+
+What the numbers say, including where MemLoc loses:
+
+- **Multi-threaded throughput is on par with mimalloc** and roughly 2-4× glibc. MemLoc
+  leads mimalloc at 2-8 threads, and they are within run-to-run noise at 16
+  threads (look at the bands).
+- **Single-threaded larson trails mimalloc by about 22 %** (104 vs 134).
+  With one thread there are no cross-thread frees, so the gap lies in the
+  thread-cache fast path or its refill from the central lists. It has not been
+  profiled yet. Profiling this benchmark earlier found a branch mispredict in
+  the size-class computation. A lookup table fixed it
+  ([D-33](docs/DECISIONS.md)) and moved MemLoc from behind glibc to ahead of it.
+- **Memory overhead is not better than glibc.** glibc's boundary-tag heap
+  refills the holes left by freed blocks with blocks of any size, which gives
+  it 1.02 after the refill phase. MemLoc gets 1.32, because a freed small span
+  can only be reused by its own size class until the whole span is empty.
+  MemLoc does beat mimalloc here (1.32 vs 1.59).
+- **realloc is fastest but uses the most memory.** In-place medium resizing
+  ([D-34](docs/DECISIONS.md)) avoids copies. MemLoc never returns
+  small or medium memory to the OS (a non-goal), so every chunk it ever used
+  stays resident. glibc can grow a block in place at the end of its heap and
+  trims freed memory from it.
+
 ## Design documents
 
 - [docs/DECISIONS.md](docs/DECISIONS.md): every design decision, the alternatives considered, and the trade-offs
