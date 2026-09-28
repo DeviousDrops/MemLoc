@@ -11,6 +11,7 @@ add_executable(memloc_tests
   size_class_test.cpp
   smoke_test.cpp
   stress_test.cpp
+  thread_test.cpp
 )
 target_link_libraries(memloc_tests PRIVATE memloc_core memloc_warnings GTest::gtest_main)
 target_include_directories(memloc_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)

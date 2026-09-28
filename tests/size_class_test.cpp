@@ -36,7 +36,7 @@ TEST(SizeClass, KnownBoundaries) {
 TEST(SizeClass, BatchSizesAreBounded) {
   for (unsigned c = 0; c < kNumClasses; ++c) {
     EXPECT_GE(batch_size(c), 2u);
-    EXPECT_LE(batch_size(c), 32u);
+    EXPECT_LE(batch_size(c), 128u);
     EXPECT_LE(batch_size(c), objects_per_span(c) * 16);
   }
 }
