@@ -6,12 +6,15 @@
 #                LD_PRELOAD (D-18)
 add_library(memloc_objects OBJECT
   central.cpp
+  debug.cpp
   fork.cpp
   huge.cpp
   malloc.cpp
   os.cpp
   page_heap.cpp
   panic.cpp
+  report.cpp
+  segv.cpp
   thread_cache.cpp
   version.cpp
 )

@@ -3,6 +3,7 @@
 #include <pthread.h>
 
 #include "central.h"
+#include "debug.h"
 #include "page_heap.h"
 
 namespace memloc {
@@ -10,7 +11,9 @@ namespace {
 
 pthread_once_t g_fork_once = PTHREAD_ONCE_INIT;
 
+// Lock order: debug -> central lists -> page heap.
 void before_fork() {
+  debug_lock();
   for (auto& list : g_central) list.lock();
   g_page_heap.lock();
 }
@@ -18,6 +21,7 @@ void before_fork() {
 void after_fork() {
   g_page_heap.unlock();
   for (unsigned c = kNumClasses; c-- > 0;) g_central[c].unlock();
+  debug_unlock();
 }
 
 void register_handlers() { pthread_atfork(before_fork, after_fork, after_fork); }

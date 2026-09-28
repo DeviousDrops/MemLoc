@@ -1,8 +1,8 @@
 // fork.h - keeps the heap usable in the child of a multi-threaded fork().
 // (D-20)
 //
-//   prepare (parent, before fork):  lock central[0..39], then page heap
-//   parent  (after fork):           unlock page heap, then central[39..0]
+//   prepare (parent, before fork):  lock debug, central[0..39], page heap
+//   parent  (after fork):           unlock page heap, central[39..0], debug
 //   child   (after fork):           same as parent
 //
 // Taking every lock first means no other thread can be half-way through a

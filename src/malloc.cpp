@@ -10,11 +10,18 @@
 //     in_chunk(p)?  span_of(p)->kind == kSmall   -> back to its class
 //                   span_of(p)->kind == kMedium  -> span back to the page heap
 //     otherwise     huge_free(p)                    munmap
+//
+// malloc, calloc and free are split in two (D-22): an inline fast path that
+// only pops or pushes the thread cache, and a noinline slow path for
+// everything else. Only the slow paths (and the rarer entry points) test
+// whether debug mode is on, so the hot path contains no trace of it.
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
 
+#include "central.h"
 #include "config.h"
+#include "debug.h"
 #include "fork.h"
 #include "huge.h"
 #include "memloc/memloc.h"
@@ -25,9 +32,14 @@
 namespace memloc {
 namespace {
 
-void* small_alloc(unsigned cls) { return tc_alloc(cls); }
+void* small_alloc(unsigned cls) {
+  void* p = tc_pop(cls);
+  return p != nullptr ? p : tc_refill(cls);
+}
 
-void small_free(unsigned cls, void* p) { tc_free(cls, p); }
+void small_free(unsigned cls, void* p) {
+  if (!tc_push(cls, p)) tc_free_slow(cls, p);
+}
 
 unsigned medium_units(std::size_t n) {
   return static_cast<unsigned>(std::max<std::size_t>(align_up(n, kUnitSize) >> kUnitShift, 1));
@@ -76,6 +88,9 @@ bool fits_in_place(const Span* s, std::size_t n) {
 }
 
 void* aligned(std::size_t align, std::size_t n) {
+  if (debug_enabled()) [[unlikely]] {
+    return debug_alloc(n, align, false);
+  }
   if (align <= kMinAlign) return alloc(n);
   if (align <= kUnitSize) {
     // Span bases are 64 KiB-aligned, so any class whose size is a multiple of
@@ -90,17 +105,79 @@ void* aligned(std::size_t align, std::size_t n) {
   return huge_alloc(n, align);
 }
 
+__attribute__((noinline)) void* malloc_slow(std::size_t n) {
+  if (debug_enabled()) return debug_alloc(n, kMinAlign, false);
+  return alloc(n);
+}
+
+__attribute__((noinline)) void* calloc_slow(std::size_t n) {
+  if (debug_enabled()) return debug_alloc(n, kMinAlign, true);
+  void* p = alloc(n);
+  // Huge blocks are fresh anonymous mappings and therefore already zero;
+  // skipping the memset avoids faulting in every page up front.
+  if (p != nullptr && n <= kMaxMedium) std::memset(p, 0, n);
+  return p;
+}
+
+__attribute__((noinline)) void free_slow(void* p) {
+  if (debug_enabled()) {
+    debug_free(p);
+    return;
+  }
+  dealloc(p);
+}
+
 }  // namespace
+
+// --- uncached allocation, the debug allocator's backing store --------------
+
+void* uncached_alloc(std::size_t n) {
+  if (n > kMaxSmall) return n <= kMaxMedium ? medium_alloc(n) : huge_alloc(n, kMinAlign);
+  const unsigned cls = size_to_class(n);
+  void* p = nullptr;
+  if (g_central[cls].fetch(cls, 1, &p) == 0) {
+    errno = ENOMEM;
+    return nullptr;
+  }
+  return p;
+}
+
+void uncached_free(void* p) {
+  if (!in_chunk(p)) {
+    huge_free(p);
+    return;
+  }
+  Span* s = span_of(p);
+  if (s->kind == SpanKind::kSmall) {
+    next_of(p) = nullptr;
+    g_central[s->size_class].release(p);
+  } else {
+    g_page_heap.free_span(s);
+  }
+}
+
+std::size_t uncached_usable_size(const void* p) { return usable_size(p); }
+
 }  // namespace memloc
 
 using namespace memloc;
 
 extern "C" {
 
-void* memloc_malloc(size_t size) { return alloc(size); }
+void* memloc_malloc(size_t size) {
+  if (size <= kMaxSmall) [[likely]] {
+    if (void* p = tc_pop(size_to_class(size))) return p;
+  }
+  return malloc_slow(size);
+}
 
 void memloc_free(void* ptr) {
-  if (ptr != nullptr) dealloc(ptr);
+  if (ptr == nullptr) return;
+  if (in_chunk(ptr)) [[likely]] {
+    const Span* s = span_of(ptr);
+    if (s->kind == SpanKind::kSmall && tc_push(s->size_class, ptr)) return;
+  }
+  free_slow(ptr);
 }
 
 void* memloc_calloc(size_t count, size_t size) {
@@ -109,14 +186,16 @@ void* memloc_calloc(size_t count, size_t size) {
     errno = ENOMEM;
     return nullptr;
   }
-  void* p = alloc(total);
-  // Huge blocks are fresh anonymous mappings and therefore already zero;
-  // skipping the memset avoids faulting in every page up front.
-  if (p != nullptr && total <= kMaxMedium) std::memset(p, 0, total);
-  return p;
+  if (total <= kMaxSmall) [[likely]] {
+    if (void* p = tc_pop(size_to_class(total))) return std::memset(p, 0, total);
+  }
+  return calloc_slow(total);
 }
 
 void* memloc_realloc(void* ptr, size_t size) {
+  if (debug_enabled()) [[unlikely]] {
+    return debug_realloc(ptr, size);
+  }
   if (ptr == nullptr) return alloc(size);
   if (size == 0) {  // glibc semantics: free and return NULL. D-9
     dealloc(ptr);
@@ -152,6 +231,12 @@ void* memloc_aligned_alloc(size_t alignment, size_t size) {
   return aligned(alignment, size);
 }
 
-size_t memloc_malloc_usable_size(const void* ptr) { return ptr == nullptr ? 0 : usable_size(ptr); }
+size_t memloc_malloc_usable_size(const void* ptr) {
+  if (ptr == nullptr) return 0;
+  if (debug_enabled()) [[unlikely]] {
+    return debug_usable_size(ptr);
+  }
+  return usable_size(ptr);
+}
 
 }  // extern "C"
