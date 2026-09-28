@@ -113,3 +113,83 @@ ctest --test-dir ~/build/memloc -R Stress --output-on-failure
 5. *What is the cost of `realloc` growing a 100 MiB block?*
    `mremap(MREMAP_MAYMOVE)`: the kernel re-points page-table entries, so no
    bytes are copied. The header lives in the mapping and moves with it.
+
+## Phase 2: Thread caches and concurrency
+
+**Built**
+- `thread_cache.{h,cpp}`: a per-thread, per-class free list in
+  `constinit thread_local` storage (initial-exec TLS, zero-initialised, so it
+  works without constructor code). Push and pop need no locks or atomics.
+  A miss fetches one batch, and a push past 2 × batch releases one (D-5, D-16).
+  A `pthread_key` destructor flushes the cache at thread exit, and the cache
+  then turns *Dead*. Frees and mallocs from later TSD destructors go straight
+  to the central lists (D-14).
+- `central.{h,cpp}`: one `std::mutex` per class, each list `alignas(64)` on
+  its own cache line (static_assert). The page heap has its own mutex, and the
+  lock order is central → page heap (D-13). The **transfer cache** (D-17) moves
+  whole batches between threads in O(1) under the lock.
+- Memory-ordering argument for the relaxed chunk-registry atomics written
+  down in D-15.
+- CI: a `tsan` job (clang, `-fsanitize=thread`, unit tests with
+  `halt_on_error=1`).
+
+**Results**
+- 34/34 tests pass under gcc 15.2, clang 21.1.8 and **ThreadSanitizer (no
+  warnings)**. Format and clang-tidy are clean.
+  - `Threads.ConcurrentRandomStress`: 8 threads × 100 000 ops across all
+    tiers, with address stamps verified before each free.
+  - `Threads.ProducerConsumerCrossThreadFrees`: 4 producers and 4 consumers
+    exchange 200 000 blocks, so every free happens on a thread other than the
+    one that allocated the block.
+  - `Threads.TransferCacheHandsBatchesBetweenThreads`,
+    `Threads.ExitingThreadFlushesItsCache` (a new thread gets back exactly the
+    same 12 objects, so nothing is stranded in a dead cache),
+    `Threads.AllocationAfterCacheTeardownStillWorks` (malloc from a TSD
+    destructor that runs after ours), `Threads.CacheRespectsHighWaterMark`,
+    `Threads.ManyShortLivedThreads`.
+- TSan negative control: a copy with the lock removed from
+  `CentralList::release` reports `WARNING: ThreadSanitizer: data race` on the
+  producer/consumer test, so the TSan job does detect races here.
+- Throwaway probe (each thread allocates, then frees, N × 64 B blocks; M
+  alloc+free pairs/s, 2 runs each). Proper benchmarks are in Phase 5.
+
+  | design                         | 1 thr, N=1000 | 8 thr, N=100 | 8 thr, N=1000 |
+  |--------------------------------|--------------:|-------------:|--------------:|
+  | glibc 2.43                     | 24–35         | 136–165      | 128–159       |
+  | D-5/D-16 only (batch ≤ 32)     | –             | 24–26        | 23            |
+  | + transfer cache               | 119–133       | 107–111      | 74–76         |
+  | + batch ≤ 128 (final, D-17)    | 101–128       | 553–853      | 265–268       |
+
+  The first version was 4–6× *slower* than glibc at 8 threads. The reason was
+  that each batch walked 32 remote cache lines while holding the class mutex.
+
+**How to run**
+```sh
+make test
+make tsan        # clang + ThreadSanitizer build in ~/build/memloc-tsan
+ctest --test-dir ~/build/memloc -R Threads --output-on-failure
+```
+
+**Interview questions**
+1. *Why doesn't a cross-thread free need to go back to the allocating thread?*
+   Blocks of one class are interchangeable. The freeing thread keeps the block
+   in its own cache, and batches carry surplus back to the central list,
+   where it can reach other threads. Ownership would matter only if spans
+   were per-thread (as in mimalloc), and here they are not.
+2. *How do you flush a `thread_local` cache at thread exit if it has no
+   destructor?* A `pthread_key` with a destructor, set on first use. It runs
+   during thread teardown. After it the cache is marked Dead, because other
+   TSD destructors may still call malloc/free and there would be nobody left
+   to flush a revived cache.
+3. *Why initial-exec TLS?* The general-dynamic model may call
+   `__tls_get_addr`, which can allocate on first access in a dlopen'ed
+   library. Inside malloc that means recursion. Initial-exec is a fixed
+   offset from the thread pointer: one instruction, no calls.
+4. *Why `alignas(64)` on each central list?* Without it, two classes' mutexes
+   could share a cache line. Threads hammering different classes would then
+   bounce that line between cores (false sharing) even though they never
+   contend logically.
+5. *What did TSan catch, and how do you know it works on your code?* It
+   caught nothing in the final build. The evidence that it is watching is the
+   negative control: removing one lock guard produced a data-race report
+   pointing at `CentralList::release`.
