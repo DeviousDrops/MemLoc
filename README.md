@@ -54,6 +54,18 @@ make tsan          # ThreadSanitizer build of the unit tests
 make format tidy   # clang-format check and clang-tidy
 ```
 
+## Using it as a drop-in malloc
+
+```sh
+LD_PRELOAD=~/build/memloc/src/libmemloc.so sqlite3 my.db
+tools/preload_demo.sh    # sqlite3 + python3 workloads, glibc vs MemLoc, outputs diffed
+```
+
+`libmemloc.so` depends only on libc. It exports the whole malloc family
+(`malloc`, `free`, `calloc`, `realloc`, `reallocarray`, `posix_memalign`,
+`aligned_alloc`, `memalign`, `valloc`, `pvalloc`, `malloc_usable_size`) and
+is fork-safe ([D-18 to D-21](docs/DECISIONS.md)).
+
 ## Design documents
 
 - [docs/DECISIONS.md](docs/DECISIONS.md): every design decision, the alternatives considered, and the trade-offs
