@@ -193,3 +193,91 @@ ctest --test-dir ~/build/memloc -R Threads --output-on-failure
    caught nothing in the final build. The evidence that it is watching is the
    negative control: removing one lock guard produced a data-race report
    pointing at `CentralList::release`.
+
+## Phase 3: libmemloc.so, an LD_PRELOAD drop-in
+
+**Built**
+- `src/preload.cpp` → `libmemloc.so`: the full glibc malloc family as thin
+  wrappers (D-18). Built `-fvisibility=hidden` and linked with
+  `-Bsymbolic-functions -z defs --as-needed -nostdlib++`. `ldd` shows
+  **only libc** for both the gcc and the clang build, and `nm -D` lists
+  exactly 19 exported symbols: the 11 glibc names plus the memloc_* API.
+- Bootstrap without dlsym (D-19): all state is `constinit`. `std::mutex` was
+  replaced by a 20-line `Mutex` over `pthread_mutex_t`, because its throwing
+  `lock()` pulled in libstdc++. A function-local static in `os_page_size`
+  needed `__cxa_guard_acquire`, so it became a relaxed atomic.
+- fork safety (D-20): `pthread_atfork` handlers take all 40 central locks
+  and then the page-heap lock, in lock order.
+- `panic()`: a signal-safe message and `abort()` when `free` / `realloc` /
+  `malloc_usable_size` receives a pointer MemLoc never returned. Checked by
+  hand: `free(stack_buf + 128)` prints
+  `memloc: free(): invalid pointer (0x00007ffc40c551e0)` and exits 134.
+- `tests/preload/preload_test.cpp` (5 tests, run with `LD_PRELOAD`, not
+  linked with the core) and `tools/preload_demo.sh` with `tools/demo/`
+  workloads (D-21). Both are registered with ctest under the label `preload`.
+  CI installs sqlite3.
+
+**Results**
+- 40/40 tests pass with gcc 15.2 and clang 21.1.8. The 34 unit tests also pass
+  under TSan (the preload tests are excluded there by design). Format and
+  clang-tidy are clean.
+- `Preload.EveryFamilyMemberResolvesIntoMemloc`: `dladdr` confirms all 11
+  functions resolve into libmemloc.so. The other tests cover glibc-only
+  entry points (memalign's rounding, valloc/pvalloc page alignment,
+  reallocarray overflow), C++ `new`/`delete` including `alignas(256)`, and
+  blocks allocated inside glibc (`strdup`, `asprintf`, `realpath`,
+  `open_memstream`) being freed by MemLoc.
+- `Preload.ForkWhileOtherThreadsAllocate`: 200 forks while 4 threads churn
+  every size class. **Negative control:** with the atfork registration
+  disabled, the *first* child deadlocked on all 3 runs (killed by its
+  5-second alarm). With it, 200/200 children succeed.
+- Real programs, `tools/preload_demo.sh`, 3 runs. The `LD_DEBUG=bindings`
+  check passes for both programs, and output is byte-identical with and
+  without MemLoc.
+
+  | workload                                   | glibc (ms)  | MemLoc (ms) |
+  |--------------------------------------------|------------:|------------:|
+  | sqlite3 3.46.1: 200k rows, 2 indexes, update/delete, VACUUM | 1958–2022 | 1956–2108 |
+  | python 3.14.4: dicts/json/re/zlib, 8 threads, fork pool     | 1352–1594 | 1496–1516 |
+  | same with `PYTHONMALLOC=malloc` (no pymalloc)               | 1564–1853 | 1466–1584 |
+
+  These are end-to-end wall times on WSL2 with a noisy spread, so the honest
+  reading is "on par". The one consistent gap is the raw-malloc Python run,
+  where every object goes through the allocator: MemLoc wins all 3 runs.
+  Controlled benchmarks are in Phase 5.
+- Found on the way: python3 has a *canonical PLT entry* for `malloc`, so
+  libc and libexpat bind `malloc` to the python3 executable, which in turn
+  binds it to libmemloc.so. The demo's check accepts bindings to the program
+  and rejects any binding into another shared library.
+
+**How to run**
+```sh
+make test                                   # includes the preload label
+ctest --test-dir ~/build/memloc -L preload --output-on-failure
+tools/preload_demo.sh                       # defaults to ~/build/memloc/src/libmemloc.so
+LD_PRELOAD=~/build/memloc/src/libmemloc.so python3
+```
+
+**Interview questions**
+1. *How does LD_PRELOAD make glibc's own internal allocations use your
+   malloc?* glibc calls `malloc` through its PLT, not directly, precisely so
+   it can be interposed. The dynamic linker resolves every reference in
+   search order (executable, then preloaded objects, then libc), and the
+   first definition wins.
+2. *Why doesn't your preload library call dlsym?* It has nothing to look up:
+   it replaces malloc instead of wrapping it. That also avoids the classic
+   recursion (dlsym → calloc → your malloc → dlsym …) that wrapper-style
+   interposers need a static bootstrap buffer for.
+3. *Why did you replace std::mutex?* `std::mutex::lock()` throws
+   `std::system_error` on failure. That made `libmemloc.so` reference
+   `std::__throw_system_error`, and therefore need libstdc++, inside every C
+   program. The allocator cannot handle a lock failure anyway, so a
+   pthread wrapper with a constexpr initializer is more honest.
+4. *What exactly goes wrong on fork without atfork handlers?* The child
+   gets a copy of memory in which some other thread's mutex is locked, but
+   that thread does not exist in the child. Its first malloc that needs that
+   lock blocks forever. The test reproduced this on the first fork.
+5. *Why does `-z defs` matter for a shared library?* Without it, an
+   unresolved symbol (like the `__cxa_guard_acquire` found here) links
+   fine and only fails at load time, possibly inside a customer's process.
+   With it, the build fails.
