@@ -795,3 +795,130 @@ Why:          Each program is a regression test for one detector, run in
               the configuration a user would really use.
 Trade-off:    Depends on addr2line (binutils) being installed. It is part of
               build-essential, so CI has it.
+
+## D-28: How memloc_stats() gets its numbers            (Phase 5)
+Context:      `memloc_stats()` must report how much memory the allocator holds
+              and how much of it the program is using. D-22 already paid to
+              keep the malloc/free fast paths free of anything except the
+              thread-cache list operation.
+Options:      A) counters updated on every malloc/free (per-thread, summed on
+              demand), as tcmalloc does; B) counters updated only on slow
+              paths; C) compute everything on demand by walking the heap
+              under its locks
+Choice:       C, plus two atomics on the OS-mapping path. `memloc_stats()`
+              takes every central lock and then the page-heap lock (the fork
+              handler's order, D-20). It then walks the chunk list: each
+              span's kind, length and `live` count give small-span bytes,
+              blocks outside the span, and medium bytes. Blocks parked in
+              transfer batches are subtracted. Huge mappings and the
+              current/peak mapped total are atomics updated in `huge.cpp`
+              and `os.cpp`, whose paths already make a system call.
+              `allocated_bytes` therefore means "blocks the shared heap has
+              handed out". That is in use by the program *or* sitting in some
+              thread's cache, and each thread cache is bounded by 2 batches
+              per class (D-14).
+Why:          Zero cost on the hot path, and the walk is exact for everything
+              the heap owns. Stats are read rarely (at exit, in benchmarks).
+Trade-off:    Calling it is not free: it stops every allocating thread for
+              a walk over all chunks (microseconds for a few hundred MiB).
+              It cannot separate "in use" from "thread-cached" without
+              per-thread counters. Reading other threads' caches would race.
+Interview Q:  "Why not keep a live-bytes counter?" - A shared atomic on every
+              malloc/free would be the hottest cache line in the
+              process. Per-thread counters work but still cost an add per
+              operation. The walk moves the cost to the rare reader.
+
+## D-29: MEMLOC_STATS=1 exit report            (Phase 5)
+Context:      The brief asks for `MEMLOC_STATS=1`: statistics without code
+              changes.
+Options:      A) JSON on stderr; B) a human-readable table on stderr;
+              C) both, selected by the value
+Choice:       B. At exit, a destructor prints totals (mapped, peak mapped,
+              allocated, huge) and one row per size class that owns spans:
+              block size, spans, span bytes, blocks out, and utilisation. It
+              uses a stack buffer and `write(2)`, never malloc. The
+              machine-readable form is the `memloc_stats()` struct, which
+              the benchmarks use.
+Why:          A person runs `MEMLOC_STATS=1 prog` to look. Programs that want
+              data link the API.
+Trade-off:    The report is a snapshot taken shortly before exit. Frees done
+              by destructors that run after ours are not in it.
+Interview Q:  "How do you print from inside an allocator at exit?" - No
+              printf (it allocates its buffer). Format into a stack buffer,
+              `write()` it, and run from a late destructor so most of the
+              program has already cleaned up.
+
+## D-30: Benchmark method            (Phase 5)
+Context:      The README must compare MemLoc with glibc and mimalloc honestly.
+Options:      A) link each benchmark three times, once against each
+              allocator; B) one set of benchmark binaries calling plain
+              `malloc`, with the allocator chosen by `LD_PRELOAD`
+Choice:       B. The `bench/` programs are built `-O2 -fno-builtin` against
+              plain libc. `tools/bench.py` runs each one with no preload
+              (glibc 2.43), with `libmimalloc.so` (Ubuntu's mimalloc 3.2.8),
+              and with `libmemloc.so`, using thread counts 1/2/4/8/16. It
+              reports the median of 5 runs per point plus the min-max range.
+              Results go to `bench/results/*.csv` together with
+              `machine.json` (CPU, cores, RAM, kernel, compilers, library
+              versions). The plots are generated from those files only.
+Why:          The same machine code runs against all three allocators, so
+              only the allocator differs. Every figure in the README
+              can be regenerated from committed data.
+Trade-off:    The machine is a WSL2 VM on a laptop (i7-13700H, 6P+8E
+              cores, 20 threads). Turbo and the hybrid cores add noise, which
+              the median of 5 only partly removes. Thread counts above 8
+              run on E-cores and hyperthreads, so scaling there is not linear
+              for any allocator. Distribution packages may be built with
+              different flags from upstream.
+Interview Q:  "How do you make an allocator benchmark fair?" - Same binary,
+              same inputs and seeds, and only the allocator swapped. Report
+              the spread, not the best run, and publish the machine and the
+              raw data.
+
+## D-31: Benchmark workloads            (Phase 5)
+Context:      The brief lists larson-style and random-size throughput,
+              RSS / live, and realloc growth.
+Choice:       Four programs, each printing CSV:
+              - `bench_larson`: each thread owns 1000 slots of 16-256 B and
+                replaces random slots. At every round boundary, threads hand
+                their slot arrays to the next thread, so a steady fraction
+                of frees are of blocks another thread allocated. This
+                pattern punishes allocators that have no cross-thread free
+                path. Metric: M ops/s (one op = free + malloc).
+              - `bench_random`: each thread keeps a window of 256 live
+                blocks with sizes drawn log-uniformly from 8 B to 32 KiB,
+                replacing a random one per op. Metric: M ops/s.
+              - `bench_rss`: allocate 256 MiB of log-uniform blocks, free a
+                random 50 %, then allocate again with different sizes.
+                Report VmRSS / live bytes after each phase (1.0 = no
+                overhead).
+              - `bench_realloc`: 64 buffers, each grown in 1-64 B steps to
+                1 MiB, in round-robin order so that a buffer cannot always
+                grow in place. Metric: ns per realloc.
+Why:          The four programs test four separate parts of an allocator:
+              throughput at scale (larson), size-class breadth (random),
+              memory efficiency (rss) and the growth path (realloc). Each
+              backs a claim the README makes.
+Trade-off:    The loads are synthetic. The Phase 3 sqlite3/python3 timings
+              remain the "real program" check. None of these simulate a
+              long-running server's fragmentation over hours.
+Interview Q:  "What does larson measure that a simple malloc/free loop
+              doesn't?" - Remote frees: blocks allocated on one thread and
+              freed on another, which must find their way back without
+              locking the whole heap.
+
+## D-32: Plots and published numbers            (Phase 5)
+Context:      The graphs must be generated from the benchmark data, and must
+              not mislead.
+Choice:       `tools/plot_bench.py` (matplotlib, Agg backend) reads
+              `bench/results/*.csv` and writes PNGs to `docs/img/`. It draws
+              throughput vs threads as lines with min-max bands, with one
+              fixed colour per allocator across all charts and a linear
+              y axis starting at zero. RSS / live and realloc are grouped
+              bars with their values printed on them. The README quotes
+              medians taken from the CSVs and states the losses as plainly
+              as the wins.
+Why:          The plots and the prose come from the same files, so they
+              cannot drift apart.
+Trade-off:    PNGs in git are binary diffs (tens of KiB each). This is
+              accepted so the README renders on GitHub with no build step.
