@@ -27,6 +27,13 @@ void CentralList::unlink(Span* s) {
 
 unsigned CentralList::fetch(unsigned cls, unsigned n, void** head) {
   const std::size_t size = class_size(cls);
+  const std::scoped_lock lock(mu_);
+  if (n == batch_size(cls) && batches_ != nullptr) {
+    *head = batches_;
+    batches_ = next_batch_of(batches_);
+    --num_batches_;
+    return n;
+  }
   void* list = nullptr;
   unsigned got = 0;
   while (got < n) {
@@ -63,6 +70,28 @@ unsigned CentralList::fetch(unsigned cls, unsigned n, void** head) {
 }
 
 void CentralList::release(void* head) {
+  const std::scoped_lock lock(mu_);
+  release_to_spans(head);
+}
+
+void CentralList::release_batch(unsigned cls, void* head) {
+  const std::size_t max_batches = kTransferBytes / (batch_size(cls) * class_size(cls));
+  const std::scoped_lock lock(mu_);
+  if (num_batches_ < max_batches) {
+    next_batch_of(head) = batches_;
+    batches_ = head;
+    ++num_batches_;
+    return;
+  }
+  release_to_spans(head);
+}
+
+unsigned CentralList::cached_batches() {
+  const std::scoped_lock lock(mu_);
+  return num_batches_;
+}
+
+void CentralList::release_to_spans(void* head) {
   while (head != nullptr) {
     void* obj = head;
     head = next_of(obj);

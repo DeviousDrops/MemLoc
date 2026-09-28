@@ -13,11 +13,16 @@
 // (no coalescing code at all). Chunks are appended to a list and searched
 // first-fit from the oldest, which packs the heap toward low addresses.
 // Chunks are never unmapped: returning memory to the OS is a non-goal.
+//
+// One mutex guards the whole page heap. It is the innermost lock: nothing is
+// called while holding it except mmap (D-13).
 #pragma once
 
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 
 #include "chunk.h"
 
@@ -39,14 +44,17 @@ class PageHeap {
   Span* alloc_span(unsigned units);
   void free_span(Span* s);
 
-  std::size_t mapped_bytes() const { return chunk_count_ * kChunkSize; }
+  std::size_t mapped_bytes() const {
+    return chunk_count_.load(std::memory_order_relaxed) * kChunkSize;
+  }
 
  private:
   Chunk* grow();
 
-  Chunk* first_ = nullptr;
-  Chunk* last_ = nullptr;
-  std::size_t chunk_count_ = 0;
+  std::mutex mu_;
+  Chunk* first_ = nullptr;                   // guarded by mu_
+  Chunk* last_ = nullptr;                    // guarded by mu_
+  std::atomic<std::size_t> chunk_count_{0};  // written under mu_, read anywhere
 };
 
 extern PageHeap g_page_heap;

@@ -7,6 +7,7 @@ add_library(memloc_core STATIC
   malloc.cpp
   os.cpp
   page_heap.cpp
+  thread_cache.cpp
   version.cpp
 )
 target_include_directories(memloc_core

@@ -2,7 +2,7 @@
 // or huge tier and implements the API-level semantics. (D-4, D-9, D-10)
 //
 //   memloc_malloc(n)
-//     n <= 32 KiB  -> small_alloc(size_to_class(n))     central list (per class)
+//     n <= 32 KiB  -> small_alloc(size_to_class(n))     thread cache -> central list
 //     n <=  1 MiB  -> medium_alloc(n)                   one page-heap span
 //     otherwise    -> huge_alloc(n)                     its own mmap
 //
@@ -14,29 +14,19 @@
 #include <cerrno>
 #include <cstring>
 
-#include "central.h"
 #include "config.h"
 #include "huge.h"
 #include "memloc/memloc.h"
 #include "page_heap.h"
 #include "size_class.h"
+#include "thread_cache.h"
 
 namespace memloc {
 namespace {
 
-void* small_alloc(unsigned cls) {
-  void* obj = nullptr;
-  if (g_central[cls].fetch(cls, 1, &obj) == 0) {
-    errno = ENOMEM;
-    return nullptr;
-  }
-  return obj;
-}
+void* small_alloc(unsigned cls) { return tc_alloc(cls); }
 
-void small_free(unsigned cls, void* p) {
-  next_of(p) = nullptr;
-  g_central[cls].release(p);
-}
+void small_free(unsigned cls, void* p) { tc_free(cls, p); }
 
 unsigned medium_units(std::size_t n) {
   return static_cast<unsigned>(std::max<std::size_t>(align_up(n, kUnitSize) >> kUnitShift, 1));

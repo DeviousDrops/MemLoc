@@ -38,11 +38,12 @@ Chunk* PageHeap::grow() {
     first_ = c;
   }
   last_ = c;
-  ++chunk_count_;
+  chunk_count_.fetch_add(1, std::memory_order_relaxed);
   return c;
 }
 
 Span* PageHeap::alloc_span(unsigned units) {
+  const std::scoped_lock lock(mu_);
   Chunk* chunk = nullptr;
   int first = -1;
   for (Chunk* c = first_; c != nullptr; c = c->next) {
@@ -69,6 +70,7 @@ Span* PageHeap::alloc_span(unsigned units) {
 }
 
 void PageHeap::free_span(Span* s) {
+  const std::scoped_lock lock(mu_);
   Chunk* c = chunk_of(s);
   const auto u = static_cast<unsigned>(s - c->spans);
   s->kind = SpanKind::kFree;

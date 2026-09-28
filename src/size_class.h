@@ -59,9 +59,9 @@ constexpr unsigned objects_per_span(unsigned c) {
   return static_cast<unsigned>(span_units(c) * kUnitSize / class_size(c));
 }
 
-// Objects moved per central-list operation: ~64 KiB worth, between 2 and 32. D-5
+// Objects moved per central-list operation: ~64 KiB worth, between 2 and 128. D-5, D-17
 constexpr unsigned batch_size(unsigned c) {
-  return static_cast<unsigned>(std::clamp<std::size_t>(kUnitSize / class_size(c), 2, 32));
+  return static_cast<unsigned>(std::clamp<std::size_t>(kUnitSize / class_size(c), 2, 128));
 }
 
 constexpr bool classes_are_valid() {
