@@ -15,6 +15,7 @@ add_library(memloc_objects OBJECT
   panic.cpp
   report.cpp
   segv.cpp
+  stats.cpp
   thread_cache.cpp
   version.cpp
 )

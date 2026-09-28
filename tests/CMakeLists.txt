@@ -10,6 +10,7 @@ add_executable(memloc_tests
   api_test.cpp
   size_class_test.cpp
   smoke_test.cpp
+  stats_test.cpp
   stress_test.cpp
   thread_test.cpp
 )
