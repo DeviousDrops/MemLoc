@@ -66,6 +66,45 @@ tools/preload_demo.sh    # sqlite3 + python3 workloads, glibc vs MemLoc, outputs
 `aligned_alloc`, `memalign`, `valloc`, `pvalloc`, `malloc_usable_size`) and
 is fork-safe ([D-18 to D-21](docs/DECISIONS.md)).
 
+## Debug mode
+
+The same library turns into a checking allocator when `MEMLOC_DEBUG=1` is
+set. When the variable is unset, the malloc/free fast paths contain no
+reference to the flag (see [D-22](docs/DECISIONS.md)).
+
+```sh
+MEMLOC_DEBUG=1 LD_PRELOAD=~/build/memloc/src/libmemloc.so ./my_program
+MEMLOC_DEBUG=1 MEMLOC_REPORT=report.jsonl LD_PRELOAD=... ./my_program
+tools/symbolize.py --text report.jsonl                # add file:line via addr2line
+make bugs                                             # run the 11 bug programs in tests/bugs
+```
+
+| Detected | How |
+|---|---|
+| heap-buffer-overflow / underflow | 16 guard bytes before and after every block, checked on free and at exit |
+| double-free, invalid-free (including interior pointers) | per-block magic numbers XORed with the address, plus a lookup of the enclosing block |
+| use-after-free | freed blocks are filled with `0xDD` and held in a 4096-block / 64 MiB quarantine; the fill is checked on eviction and at exit |
+| leaks | live blocks at exit, grouped by allocation stack and sorted by bytes; allocations made by libc and the loader are counted separately |
+| SIGSEGV / SIGBUS | the handler runs on an alternate stack and describes the faulting address relative to the heap |
+
+Each finding is a single JSON line, appended to the file named by
+`MEMLOC_REPORT` (or written to stderr), plus a one-line summary on stderr. The record
+holds the program, the thread, and the stack, plus the allocation and free
+stacks with their threads. Frames are stored as module + offset. The
+symbolizer turns them into this:
+
+```
+== heap-buffer-overflow at 0x7eed0b8700d0: wrote past the end of a 16-byte block: 1 of the 16 guard bytes after it changed, first at offset 16
+  stack (thread 448):
+    #0  main  tests/bugs/off_by_one.c:16
+  alloc_stack (thread 448):
+    #0  copy_name  tests/bugs/off_by_one.c:8
+    #1  main  tests/bugs/off_by_one.c:14
+```
+
+Debug mode is slow on purpose: sqlite3 runs about 4× slower and python3
+about 2.3× slower (see [PROGRESS](docs/PROGRESS.md#phase-4-debug-mode)).
+
 ## Design documents
 
 - [docs/DECISIONS.md](docs/DECISIONS.md): every design decision, the alternatives considered, and the trade-offs

@@ -281,3 +281,106 @@ LD_PRELOAD=~/build/memloc/src/libmemloc.so python3
    unresolved symbol (like the `__cxa_guard_acquire` found here) links
    fine and only fails at load time, possibly inside a customer's process.
    With it, the build fails.
+
+## Phase 4: Debug mode
+
+**Built**
+- Fast/slow split (D-22): `memloc_malloc`, `memloc_free` and `memloc_calloc`
+  try the thread cache inline and otherwise call a `noinline` slow path. Only
+  the slow path reads `g_debug`. Debug mode disables the thread caches, so
+  every call reaches the slow path.
+- `src/debug.cpp`, the checking allocator (D-23, D-25):
+  - a 192-byte header, then 16 canary bytes on each side of the user block;
+  - live and freed magics XORed with the user address;
+  - `0xBE` fill on malloc and `0xDD` poison on free;
+  - a FIFO quarantine of 4096 blocks / 64 MiB;
+  - interior-pointer lookup for invalid frees;
+  - leaks at exit, grouped by allocation stack.
+- `src/report.cpp` (D-24): one JSON line per finding, written with no
+  allocation. It holds the program, pid, tid, detail, and `stack`,
+  `alloc_stack` and `free_stack` with their thread ids. It also holds a heap
+  snapshot. Frames are module + offset (from `dladdr`), with MemLoc's own
+  frames trimmed. There is a recursion guard, and `backtrace()` is warmed up
+  at start-up.
+- `src/segv.cpp` (D-26): a SIGSEGV/SIGBUS handler on a 64 KiB alternate
+  stack. It reports the fault PC and describes the faulting address: null,
+  outside the heap, a chunk header, class/block/byte of a small span, or a
+  free span.
+- `tools/symbolize.py` runs addr2line once per module and has a `--text`
+  view. `tools/run_bugs.py` checks each bug program against
+  `tests/bugs/expected.json`.
+- `tests/bugs/` (D-27) holds 11 programs, one bug each: off-by-one,
+  underflow, double free, use-after-free, stale pointer after realloc,
+  interior free, free of a non-heap pointer, leaks from 2 sites, null
+  dereference, overflow through `new[]`, and a cross-thread use-after-free.
+  Each has a ground-truth root cause and fix, which Phase 6 evaluates against.
+
+**Results**
+- 52/52 ctest with gcc 15.2 and clang 21.1.8: 34 unit, 7 preload, 11 bugs.
+  The preload count includes the whole preload suite re-run under
+  `MEMLOC_DEBUG=1` (minus one usable-size test). TSan 34/34. clang-format
+  and clang-tidy are clean.
+- `make bugs`: **11/11 caught**. Each record has the expected type and
+  signal, and names the buggy function in the expected stack, with file:line
+  after symbolization. `thread_uaf` reports alloc thread 612 and free
+  thread 613, both different from the main thread.
+- Zero cost when off: `objdump -d libmemloc.so` shows 0 references to
+  `g_debug` in `memloc_malloc` (41 instructions), `memloc_free` (62) and
+  `memloc_calloc` (50).
+- Throughput with debug off, before → after the split (M malloc/free pairs/s,
+  3 runs, working set N; noisy WSL2 box):
+
+  | threads | N | before | after |
+  |---|---|---|---|
+  | 1 | 100 | 97–224 | 185–205 |
+  | 1 | 1000 | 108–152 | 144–177 |
+  | 8 | 100 | 604–942 | 850–947 |
+  | 8 | 1000 | 267–281 | 268–291 |
+
+  In other words, no regression. glibc on the same probe: 26–40 (1 thread)
+  and 138–190 (8 threads).
+- Cost of debug mode (wall time, 2 runs, normal → debug):
+  - `tools/demo` sqlite3 workload: 1875/1504 ms → 7327/7060 ms (about 4×),
+    with byte-identical output;
+  - python3 workload: 1322/1226 ms → 2870/2814 ms (about 2.3×);
+  - python3 with `PYTHONMALLOC=malloc`, where every object goes through debug
+    malloc: about 52–56 s.
+- sqlite3 under debug reports 14 leaked blocks (4841 bytes) from 6 sites,
+  plus 2 system blocks. These are sqlite's process-lifetime allocations, and
+  there are no false errors. python3 reports 70 leak sites, which are
+  interpreter-lifetime allocations it deliberately never frees.
+
+**How to run**
+```sh
+make bugs                                   # 11 programs, reports kept in ~/build/memloc/bug-reports
+MEMLOC_DEBUG=1 MEMLOC_REPORT=r.jsonl LD_PRELOAD=~/build/memloc/src/libmemloc.so ./prog
+tools/symbolize.py --text r.jsonl
+ctest --test-dir ~/build/memloc -L bugs --output-on-failure
+```
+
+**Interview questions**
+1. *How can a runtime debug flag cost nothing?* Don't test it where it
+   would cost. The inline fast path is a thread-cache pop or push and never
+   reads the flag. Only the out-of-line slow path does, and it is already
+   paying for a lock. Debug mode keeps the caches empty, so it forces every
+   call onto that path. objdump confirms 0 references.
+2. *How do you detect use-after-free without a page per allocation?* Poison
+   the block on free and keep it out of circulation in a quarantine. When it
+   leaves the quarantine (or at exit), check that the poison is intact. This
+   catches writes after free, but not reads. Catching reads needs guard pages
+   (Electric Fence) or shadow memory (ASan).
+3. *Why does the report store module + offset rather than function and
+   line?* DWARF parsing allocates and is slow, and the process may be
+   crashing. Module + offset is stable across ASLR, so an offline tool
+   (addr2line) can resolve it later. That is the same split used by crash
+   reporters such as Breakpad.
+4. *What's unsafe about your SIGSEGV handler and why is it acceptable?*
+   `backtrace()` and `dladdr()` are not async-signal-safe. `backtrace()` is
+   warmed up at start-up, so it doesn't dlopen libgcc_s inside the handler.
+   The process is dying anyway, and a report with a stack is worth the risk
+   of a deadlock in a rare corner case.
+5. *How do you avoid reporting libc's allocations as leaks?* Group leaks by
+   allocation stack. A group counts as "system" (reported only as a count)
+   if its innermost frame is in the dynamic loader, if any frame is
+   `_IO_file_doallocate` (the stdio buffer), or if no frame is outside
+   system libraries.

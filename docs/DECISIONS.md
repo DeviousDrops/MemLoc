@@ -724,6 +724,14 @@ Choice:       B. One JSON object per line, written with `write(2)` from a
               (libc, libstdc++, ld.so, libmemloc itself) are counted
               in the summary as `system_blocks`, not reported as sites.
               Example: stdio's never-freed buffer.
+              *Amended during implementation:* stdio's buffer is allocated
+              from printf with `main` still on the stack, so the "never
+              leaves system libraries" rule alone misses it. A group also
+              counts as system when its innermost frame is in the dynamic
+              loader (thread TLS blocks) or any frame is
+              `_IO_file_doallocate`. Canary and use-after-free records carry
+              a numeric `offset`, leak records `blocks`/`bytes`, `segv`
+              records `signal`. At most 25 sites are reported individually.
 Why:          Machine-readable from the start. The triage tool groups by
               `type` + top user frames without parsing text.
 Trade-off:    A leak here means "not freed at exit" with no reachability
@@ -756,6 +764,12 @@ Trade-off:    backtrace() is not on POSIX's async-signal-safe list. After
               the warm-up it neither allocates nor locks in practice (the
               same pragmatic choice many crash reporters make). The heap
               snapshot is read without locks, so it can be torn.
+              *Found during implementation:* frames are named with dladdr(),
+              which takes the loader's (recursive) lock and is not
+              async-signal-safe either; without it the record has no module
+              offsets and cannot be symbolised. The alternate stack is
+              per-thread, so only the main thread can report its own stack
+              overflow.
 Interview Q:  "What can you safely do in a SIGSEGV handler?" - Only
               async-signal-safe functions: no malloc, no printf, no mutexes.
               Pre-allocate everything (alt stack, buffers), format by hand,
