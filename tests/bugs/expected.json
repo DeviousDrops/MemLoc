@@ -1,0 +1,101 @@
+{
+  "off_by_one": {
+    "source": "off_by_one.c",
+    "type": "heap-buffer-overflow",
+    "signal": "SIGABRT",
+    "function": "copy_name",
+    "in": "alloc_stack",
+    "root_cause": "copy_name allocates strlen(name) bytes and strcpy writes strlen(name) + 1, so the terminating NUL lands one byte past the end of the block.",
+    "fix": "Allocate strlen(name) + 1 bytes (or use strdup)."
+  },
+  "underflow": {
+    "source": "underflow.c",
+    "type": "heap-buffer-underflow",
+    "signal": "SIGABRT",
+    "function": "build_histogram",
+    "in": "alloc_stack",
+    "root_cause": "bucket_of returns -1 for a negative sample and build_histogram uses it as an index, writing hist[-1] before the start of the block.",
+    "fix": "Clamp negative samples to bucket 0 in bucket_of (or validate the index before incrementing)."
+  },
+  "double_free": {
+    "source": "double_free.c",
+    "type": "double-free",
+    "signal": "SIGABRT",
+    "function": "release_request",
+    "in": "stack",
+    "root_cause": "handle_request frees req->body on its error path without clearing it, and release_request frees the same pointer again.",
+    "fix": "Give the body a single owner: remove the free from handle_request's error path, or set req->body = NULL after freeing it there."
+  },
+  "use_after_free": {
+    "source": "use_after_free.c",
+    "type": "use-after-free",
+    "signal": "SIGABRT",
+    "function": "evict",
+    "in": "free_stack",
+    "root_cause": "evict frees the cache entry while main still holds a pointer to it, and record_hit then increments hits in the freed block.",
+    "fix": "Do not use an entry after evicting it: look it up again, or record the hit before calling evict."
+  },
+  "realloc_stale": {
+    "source": "realloc_stale.c",
+    "type": "use-after-free",
+    "signal": "SIGABRT",
+    "function": "append",
+    "in": "free_stack",
+    "root_cause": "main keeps header = b.data, append grows the buffer with realloc which moves it, and the write through header lands in the freed old block.",
+    "fix": "Store an offset instead of a pointer into the buffer, or re-derive the pointer from b.data after every append."
+  },
+  "interior_free": {
+    "source": "interior_free.c",
+    "type": "invalid-free",
+    "signal": "SIGABRT",
+    "function": "process_line",
+    "in": "stack",
+    "root_cause": "process_line frees word, a pointer that skip_spaces advanced into the middle of the strdup'd line, instead of the pointer strdup returned.",
+    "fix": "Free the original pointer: free(line)."
+  },
+  "free_stack": {
+    "source": "free_stack.c",
+    "type": "invalid-free",
+    "signal": "SIGABRT",
+    "function": "greet",
+    "in": "stack",
+    "root_cause": "When user is NULL, greet points name at the local array fallback and then passes that stack address to free.",
+    "fix": "Only free what was allocated: track ownership with a flag, or always strdup the fallback."
+  },
+  "leak": {
+    "source": "leak.c",
+    "type": "leak",
+    "signal": null,
+    "functions": ["load_setting", "make_cache"],
+    "in": "alloc_stack",
+    "root_cause": "The strings returned by load_setting in main's loop and the table returned by make_cache are never freed.",
+    "fix": "Free each load_setting result after printing it and free the cache before returning from main."
+  },
+  "null_deref": {
+    "source": "null_deref.c",
+    "type": "segv",
+    "signal": "SIGSEGV",
+    "function": "print_device",
+    "in": "stack",
+    "root_cause": "find_device returns NULL for an unknown id and print_device dereferences the result without checking it.",
+    "fix": "Check the result of find_device for NULL in print_device and report the unknown id."
+  },
+  "new_overflow": {
+    "source": "new_overflow.cpp",
+    "type": "heap-buffer-overflow",
+    "signal": "SIGABRT",
+    "function": "make_squares",
+    "in": "alloc_stack",
+    "root_cause": "make_squares loops with i <= n and writes squares[n], one element past the end of the new long[n] array.",
+    "fix": "Use i < n as the loop condition (or std::vector with bounds-checked access)."
+  },
+  "thread_uaf": {
+    "source": "thread_uaf.c",
+    "type": "use-after-free",
+    "signal": "SIGABRT",
+    "function": "worker_main",
+    "in": "free_stack",
+    "root_cause": "worker_main frees the job after processing it, but submit_job writes job->status after joining the worker, so the write hits freed memory.",
+    "fix": "Define one owner: let submit_job free the job after setting its status, and do not free it in worker_main."
+  }
+}

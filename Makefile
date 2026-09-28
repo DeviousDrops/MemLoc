@@ -3,7 +3,7 @@ BUILD ?= $(HOME)/build/memloc
 TSAN_BUILD ?= $(HOME)/build/memloc-tsan
 GEN := $(shell command -v ninja >/dev/null && echo -G Ninja)
 
-.PHONY: all build test tsan format format-fix tidy clean
+.PHONY: all build test bugs tsan format format-fix tidy clean
 
 all: test
 
@@ -13,6 +13,11 @@ build:
 
 test: build
 	ctest --test-dir $(BUILD) --output-on-failure -j8
+
+# Debug-mode bug suite only, with symbolised reports kept for inspection.
+bugs: build
+	tools/run_bugs.py --lib $(BUILD)/src/libmemloc.so --bin-dir $(BUILD)/tests/bugs \
+	  --keep $(BUILD)/bug-reports
 
 tsan:
 	cmake -S . -B $(TSAN_BUILD) $(GEN) -DCMAKE_BUILD_TYPE=RelWithDebInfo \

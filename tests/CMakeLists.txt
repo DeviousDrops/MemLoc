@@ -29,7 +29,16 @@ if(NOT MEMLOC_SANITIZER)
     PROPERTIES LABELS preload TIMEOUT 120
                ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:memloc>")
 
+  # The same suite in debug mode: threads, fork and glibc-internal blocks all
+  # going through the checking allocator. Usable sizes differ there (D-23).
+  add_test(NAME preload_tests_debug_mode
+    COMMAND memloc_preload_tests --gtest_filter=-Preload.CppNewAndDeleteReachMemloc)
+  set_tests_properties(preload_tests_debug_mode PROPERTIES LABELS preload TIMEOUT 300
+    ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:memloc>;MEMLOC_DEBUG=1")
+
   add_test(NAME preload_demo
     COMMAND ${PROJECT_SOURCE_DIR}/tools/preload_demo.sh $<TARGET_FILE:memloc>)
   set_tests_properties(preload_demo PROPERTIES LABELS preload TIMEOUT 300 SKIP_RETURN_CODE 77)
+
+  add_subdirectory(bugs)  # debug-mode bug suite, label "bugs" (D-27)
 endif()
