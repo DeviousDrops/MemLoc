@@ -1015,6 +1015,8 @@ Interview Q:  "Why also validate after a guaranteed schema?" - The guarantee
               The same validator guards the mock and the real path.
 
 ## D-37: One Claude call per group, with source context            (Phase 6)
+Amended:      D-40 replaces Claude with Groq. One call per group with source
+              context still stands.
 Context:      A stack of function names is often not enough to find the
               root cause. Knowing that `release_request` double-freed does
               not say which earlier path freed the pointer.
@@ -1057,6 +1059,8 @@ Interview Q:  "How would you trust the judge?" - Spot-check its verdicts
               judge model to see whether scores move.
 
 ## D-39: Mocked model and trace log            (Phase 6)
+Amended:      D-40: `--llm auto` now keys on `GROQ_API_KEY`, and the tests
+              fake the HTTP transport instead of an SDK client.
 Context:      CI and contributors have no API key, but the tool still needs
               tests. Real runs need an audit trail.
 Choice:       `--llm auto` uses Claude when `ANTHROPIC_API_KEY` is set and
@@ -1077,3 +1081,34 @@ Trade-off:    The fake client can drift from the real SDK. One real
 Interview Q:  "What does the LLM beat the baseline on?" - Root cause and
               fix. The baseline already names the function, but it cannot
               explain an ownership bug that spans two functions.
+
+## D-40: Groq instead of Claude, over plain HTTP            (Phase 6)
+Context:      The Claude API is paid, and the eval needs one real run by the
+              project's author. Groq's free tier serves open-weight models
+              through an OpenAI-compatible chat API. This supersedes the
+              model, SDK and key choices in D-37 and D-39.
+Options:      A) keep Claude and pay; B) Claude plus Groq as a second
+              backend; C) Groq only, through the `groq` SDK; D) Groq only,
+              through `urllib` from the standard library.
+Choice:       D. `openai/gpt-oss-120b`, one of the models Groq serves with
+              strict JSON-schema decoding (`response_format.json_schema`,
+              `strict: true`), so D-36 still holds. The key comes only from
+              `GROQ_API_KEY`. On HTTP 429 the client sleeps for `retry-after`
+              (capped) and retries, because the free tier allows 8K tokens
+              per minute. `--llm auto` uses Groq when the key is set and the
+              mock otherwise. `--model` picks another Groq model.
+Why:          Free, so the eval can actually be run. One POST with a JSON
+              body needs no SDK, which means no pip install. WSL's Python
+              ships without pip, and the tool now runs on any python3. The
+              tests can always run the real client against a local HTTP
+              stub, instead of skipping when a package is missing.
+Trade-off:    An open 120B model will likely find fewer root causes than a
+              frontier model, and the judge is the same model grading itself.
+              Adaptive thinking and server-side fallbacks are gone, and a
+              rate-limited run takes minutes instead of seconds. Hand-rolled
+              HTTP means doing retries and error parsing ourselves (about 20
+              lines).
+Interview Q:  "Why not use the vendor SDK?" - For one endpoint and one
+              request shape, the SDK adds an install step and a dependency
+              to track, and buys nothing. I'd switch as soon as I needed
+              streaming or tool calls.
