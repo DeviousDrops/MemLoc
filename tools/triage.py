@@ -3,11 +3,11 @@
 
     tools/triage.py report r.jsonl ...        # group, then root cause + fix per group
     tools/triage.py eval --reports DIR        # score against tests/bugs/expected.json
-    --llm auto|mock|claude                    # auto: Claude if ANTHROPIC_API_KEY is set
+    --llm auto|mock|groq                      # auto: Groq if GROQ_API_KEY is set
 
 Reports should be symbolized (tools/symbolize.py, or `make bugs`) so frames
 carry function, file and line. Every model call is appended to the trace
-file as one JSON line. The API key is read from the environment by the SDK.
+file as one JSON line. The API key is read from GROQ_API_KEY only.
 
     reports ──> signature ──> groups ──> prompt (report + source) ──> LLM
                 (D-35)                                   JSON schema (D-36)
@@ -23,10 +23,12 @@ import os
 import re
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-MODEL = "claude-opus-5"
+MODEL = "openai/gpt-oss-120b"  # strict JSON-schema decoding on Groq
 STACKS = ("stack", "alloc_stack", "free_stack")
 SYSTEM_MODULE = re.compile(r"^(/usr)?/lib|/ld-linux|/libmemloc")
 BUG_TYPES = ["heap-buffer-overflow", "heap-buffer-underflow", "double-free", "use-after-free",
@@ -176,43 +178,62 @@ class MockLLM:
                 "reason": "keyword recall >= 0.4"}, {"model": "mock"}
 
 
-class ClaudeLLM:
-    name = "claude"
+class GroqLLM:
+    """Groq's OpenAI-compatible chat API over urllib: no SDK to install (D-40)."""
+    name = "groq"
+    URL = "https://api.groq.com/openai/v1/chat/completions"
 
-    def __init__(self, model: str = MODEL, client=None):
-        try:  # only needed for real calls; the tests pass a fake client
-            import anthropic
-        except ImportError:
-            sys.exit("triage: --llm claude needs the SDK: pip install -r tools/requirements-triage.txt")
-        self.anthropic, self.model = anthropic, model
-        self.client = client or anthropic.Anthropic()
+    def __init__(self, model: str = MODEL, url: str = URL, post=None, retries: int = 5):
+        self.model, self.url, self.retries = model, url, retries
+        self.post = post or self._post  # the tests pass a fake transport
 
-    def _call(self, system: str, prompt: str, schema: dict, max_tokens: int) -> tuple[dict, dict]:
-        start = time.monotonic()
+    def _post(self, body: dict) -> tuple[int, dict, dict]:
+        key = os.environ.get("GROQ_API_KEY") or sys.exit("triage: GROQ_API_KEY is not set")
+        req = urllib.request.Request(self.url, data=json.dumps(body).encode(), headers={
+            "Authorization": f"Bearer {key}", "Content-Type": "application/json",
+            "User-Agent": "memloc-triage"})
         try:
-            resp = self.client.beta.messages.create(
-                model=self.model, max_tokens=max_tokens, system=system,
-                messages=[{"role": "user", "content": prompt}],
-                thinking={"type": "adaptive"},
-                output_config={"format": {"type": "json_schema", "schema": schema}},
-                betas=["server-side-fallback-2026-07-01"], fallbacks="default")
-        except self.anthropic.AuthenticationError:
-            raise  # no point trying the other groups
-        except self.anthropic.APIError as e:  # status, rate limit, connection; SDK already retried
-            raise RuntimeError(f"{type(e).__name__}: {e}") from e
-        meta = {"model": getattr(resp, "model", self.model), "stop_reason": resp.stop_reason,
-                "latency_s": round(time.monotonic() - start, 2),
-                "usage": {k: getattr(resp.usage, k, None) for k in ("input_tokens", "output_tokens")}}
-        if resp.stop_reason != "end_turn":  # refusal or max_tokens: no complete JSON
-            raise RuntimeError(f"stop_reason {resp.stop_reason}: {meta}")
-        text = next(b.text for b in resp.content if b.type == "text")
+            with urllib.request.urlopen(req, timeout=180) as r:
+                status, headers, raw = r.status, r.headers, r.read()
+        except urllib.error.HTTPError as e:
+            status, headers, raw = e.code, e.headers, e.read()
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"connection failed: {e.reason}") from e
+        try:
+            data = json.loads(raw or b"{}")
+        except json.JSONDecodeError:
+            data = {"error": {"message": raw[:200].decode(errors="replace")}}
+        return status, {k.lower(): v for k, v in headers.items()}, data
+
+    def _call(self, system: str, prompt: str, schema: dict, name: str, max_tokens: int) -> tuple[dict, dict]:
+        body = {"model": self.model, "max_completion_tokens": max_tokens,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+                "response_format": {"type": "json_schema",
+                                    "json_schema": {"name": name, "strict": True, "schema": schema}}}
+        start = time.monotonic()
+        for attempt in range(self.retries):
+            status, headers, resp = self.post(body)
+            if status not in (429, 500, 502, 503) or attempt == self.retries - 1:
+                break
+            time.sleep(min(60.0, float(headers.get("retry-after") or 2 ** attempt)))  # free tier: 8K TPM
+        if status == 401:
+            sys.exit("triage: Groq rejected GROQ_API_KEY (HTTP 401)")  # no point trying the other groups
+        if status != 200:
+            raise RuntimeError(f"HTTP {status}: {resp.get('error', {}).get('message', resp)}")
+        choice, usage = resp["choices"][0], resp.get("usage", {})
+        meta = {"model": resp.get("model", self.model), "finish_reason": choice.get("finish_reason"),
+                "latency_s": round(time.monotonic() - start, 2), "attempts": attempt + 1,
+                "usage": {k: usage.get(k) for k in ("prompt_tokens", "completion_tokens")}}
+        if choice.get("finish_reason") != "stop":  # "length": cut off, no complete JSON
+            raise RuntimeError(f"finish_reason {choice.get('finish_reason')}: {meta}")
+        text = choice["message"]["content"]
         return json.loads(text), {**meta, "raw": text}
 
     def triage(self, prompt: str, g: dict) -> tuple[dict, dict]:
-        return self._call(SYSTEM_PROMPT, prompt, RESULT_SCHEMA, 16000)
+        return self._call(SYSTEM_PROMPT, prompt, RESULT_SCHEMA, "triage", 8000)
 
     def judge(self, prompt: str, answer: dict, truth: dict) -> tuple[dict, dict]:
-        return self._call(JUDGE_PROMPT, prompt, JUDGE_SCHEMA, 4000)
+        return self._call(JUDGE_PROMPT, prompt, JUDGE_SCHEMA, "verdict", 4000)
 
 
 def ask(llm, kind: str, prompt: str, trace: Trace, *args, **log) -> tuple[dict | None, str | None]:
@@ -262,13 +283,13 @@ def main() -> int:
     ap.add_argument("files", nargs="*", type=Path, help="report .jsonl files (report)")
     ap.add_argument("--reports", type=Path, help="directory of <bug>.jsonl reports (eval)")
     ap.add_argument("--expected", type=Path, default=ROOT / "tests" / "bugs" / "expected.json")
-    ap.add_argument("--llm", choices=["auto", "mock", "claude"], default="auto")
+    ap.add_argument("--llm", choices=["auto", "mock", "groq"], default="auto")
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--trace", type=Path, help="append one JSON line per model call here")
     ap.add_argument("--json", action="store_true", help="print JSON instead of text")
     args = ap.parse_args()
-    kind = args.llm if args.llm != "auto" else "claude" if os.environ.get("ANTHROPIC_API_KEY") else "mock"
-    llm, trace = ClaudeLLM(args.model) if kind == "claude" else MockLLM(), Trace(args.trace)
+    kind = args.llm if args.llm != "auto" else "groq" if os.environ.get("GROQ_API_KEY") else "mock"
+    llm, trace = GroqLLM(args.model) if kind == "groq" else MockLLM(), Trace(args.trace)
 
     if args.command == "report":
         if not args.files:
