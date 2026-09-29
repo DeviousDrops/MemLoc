@@ -2,7 +2,7 @@
 BUILD ?= $(HOME)/build/memloc
 TSAN_BUILD ?= $(HOME)/build/memloc-tsan
 PYTHON ?= python3
-LLM ?= claude
+LLM ?= groq
 GEN := $(shell command -v ninja >/dev/null && echo -G Ninja)
 
 .PHONY: all build test bugs triage-eval bench plots tsan format format-fix tidy clean
@@ -22,7 +22,7 @@ bugs: build
 	  --keep $(BUILD)/bug-reports
 
 # LLM triage of the bug reports, scored against tests/bugs/expected.json.
-# Needs ANTHROPIC_API_KEY and the anthropic package; LLM=mock runs offline.
+# Needs GROQ_API_KEY (free at console.groq.com); LLM=mock runs offline.
 triage-eval: bugs
 	$(PYTHON) tools/triage.py eval --reports $(BUILD)/bug-reports --llm $(LLM) \
 	  --trace $(BUILD)/triage-trace.jsonl
