@@ -244,7 +244,28 @@ Without a key, `--llm auto` falls back to a rule-based mock. It blames the
 innermost user frame of the stack that the report type points at (allocation
 stack for overflows and leaks, free stack for use-after-free). This baseline
 gets **type 11/11 and culprit 11/11, but root cause 2/11 and fix 0/11**, so
-explaining the cause and the fix is the part the model has to add. The unit
+explaining the cause and the fix is the part the model has to add.
+
+Results on the 11 bug programs (`make triage-eval`, 2026-09-29, 23 calls,
+about 2 minutes on the free tier with 16 rate-limit retries):
+
+| | type | culprit (exact) | root cause | fix |
+|---|---|---|---|---|
+| mock baseline | 11/11 | 11/11 | 2/11 | 0/11 |
+| `openai/gpt-oss-120b` on Groq | 11/11 | 5/11 | 11/11 | 11/11 |
+
+The model explains every bug correctly but names the expected culprit only 5
+times. In all 6 misses it blamed the *other* function of a two-function bug,
+and the expected one still appears in its explanation. For example, in
+`underflow` it blamed `bucket_of`, which returns -1, rather than
+`build_histogram`, which indexes with it. In `double_free` it blamed
+`handle_request`, which frees early, rather than `release_request`, which
+frees again. A single culprit field is ambiguous for ownership bugs, so the
+score is kept strict and the ambiguity is reported. Root cause and fix are
+graded by the same model, which can be lenient. All 11 verdicts were
+checked by hand against `expected.json`.
+
+The unit
 tests (`ctest -L triage`) run offline against checked-in reports. They use a
 fake HTTP transport, plus a local stub server that the real client talks to.
 

@@ -492,10 +492,23 @@ MEMLOC_STATS=1 LD_PRELOAD=~/build/memloc/src/libmemloc.so python3 -c 'print(1)'
 - Mock baseline on the 11 bugs: type 11/11, culprit 11/11, root cause 2/11
   (18 %), fix 0/11. 23 trace lines (12 triage calls, since the leak has two
   sites, plus 11 judge calls).
-- **The real Groq eval has not been run yet.** It needs the author's free
-  `GROQ_API_KEY`. The client does reach the live endpoint: a bogus key gets
-  Groq's HTTP 401 back and stops the run. `make triage-eval` with a real key
-  is the remaining check.
+- Groq, `openai/gpt-oss-120b` (`make triage-eval`, 2026-09-29): type 11/11,
+  culprit 5/11 (exact match), root cause 11/11, fix 11/11. It made 23 calls
+  with no errors, 18,125 prompt and 7,008 completion tokens, in 124 s. 16
+  calls were retried after HTTP 429 (the free tier allows 8K tokens per
+  minute).
+- All 6 culprit misses blame the other function of a two-function bug, and
+  the expected function still appears in the root cause:
+  - underflow: `bucket_of` (returns -1) instead of `build_histogram` (indexes with it)
+  - double_free: `handle_request` (frees early) instead of `release_request` (frees again)
+  - use_after_free: `main` (keeps the pointer) instead of `evict` (frees it)
+  - realloc_stale: `main` (keeps the pointer) instead of `append` (reallocs)
+  - leak: `main` (never frees) instead of `make_cache` (allocates)
+  - thread_uaf: `submit_job` (uses the job) instead of `worker_main` (frees it)
+
+  The metric stays strict rather than being loosened after seeing results.
+  Every judge verdict was checked by hand against `expected.json`, because
+  the judge is the same model.
 - ctest: gcc 64/64 (41 unit, 7 preload, 11 bugs, 4 bench smoke, 1 triage).
   The triage tests (all 14) pass on Python 3.14 (WSL) and 3.13 (Windows).
 
@@ -518,7 +531,13 @@ ctest --test-dir ~/build/memloc -L triage
    and returns canned replies, including rate limits, truncation and bad
    JSON. A stub HTTP server checks that the real client puts the same
    fields on the wire.
-3. *Why is the baseline so strong on culprit?* The debug allocator already
+3. *The model got every root cause right but only 5/11 culprits. Why?*
+   The misses were all two-function ownership bugs, where the model blamed
+   the side that keeps or uses the pointer and the ground truth blames the
+   side that frees it. Both are defensible. The lesson is that the label
+   was ambiguous, not that the model was wrong. I'd change the ground truth
+   to accept a set of culprits, and apply that to the next run, not this one.
+   *Why is the baseline so strong on culprit?* The debug allocator already
    records the right stack for each bug type: the allocation stack for
    overflows, the free stack for use-after-free. Blaming the top user frame
    there is correct for all 11 programs. The model's value is the *why* and
