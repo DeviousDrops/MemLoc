@@ -207,11 +207,11 @@ What the numbers say, including where MemLoc loses:
 
 ## AI triage of bug reports
 
-`tools/triage.py` (about 300 lines, stdlib plus the `anthropic` SDK) turns
+`tools/triage.py` (about 320 lines, Python standard library only) turns
 a pile of debug-mode reports into one diagnosis per distinct bug:
 
 ```
-reports ──► group by stack signature ──► prompt: report + source ──► Claude ──► JSON result
+reports ──► group by stack signature ──► prompt: report + source ──► LLM ──► JSON result
             (type + user functions)       (±12 lines per frame)      (schema)    type, culprit,
                                                                                  root cause, fix
 ```
@@ -220,13 +220,13 @@ reports ──► group by stack signature ──► prompt: report + source ─
   and the innermost 3 user-code functions of each stack. It ignores addresses,
   offsets, pids and line numbers, so repeated runs and rebuilds collapse into one group.
 - **Structured output** ([D-36](docs/DECISIONS.md)): the request carries a JSON
-  schema (`output_config.format`), so the answer is always parseable. The
-  client still checks `stop_reason` and re-validates the fields.
-- **Model** ([D-37](docs/DECISIONS.md)): `claude-opus-5` with adaptive
-  thinking. Server-side fallbacks are enabled (`fallbacks: "default"`, beta
-  `server-side-fallback-2026-07-01`), so the API can serve a request on a
-  fallback model instead of failing it. The key is read only from
-  `ANTHROPIC_API_KEY`.
+  schema with strict decoding (`response_format.json_schema`), so the answer
+  is always parseable. The client still checks `finish_reason` and
+  re-validates the fields.
+- **Model** ([D-40](docs/DECISIONS.md)): `openai/gpt-oss-120b` on Groq's free
+  tier, called with `urllib`, so there is no SDK to install. `--model`
+  chooses another Groq model. The key is read only from `GROQ_API_KEY`, and
+  rate-limited requests are retried after the server's `retry-after`.
 - **Eval** ([D-38](docs/DECISIONS.md)): each of the 11 programs in `tests/bugs`
   is scored against `expected.json`. Type and culprit must match exactly, and
   a second model call judges root cause and fix. Every call, including the
@@ -234,8 +234,7 @@ reports ──► group by stack signature ──► prompt: report + source ─
   ([D-39](docs/DECISIONS.md)).
 
 ```sh
-pip install -r tools/requirements-triage.txt             # the SDK, for real runs only
-export ANTHROPIC_API_KEY=...                             # never committed
+export GROQ_API_KEY=...                                  # free at console.groq.com; never committed
 tools/triage.py report ~/build/memloc/bug-reports/*.jsonl
 make triage-eval                                         # run the bug suite, then the scored eval
 make triage-eval LLM=mock                                # offline baseline, no key needed
@@ -247,7 +246,7 @@ stack for overflows and leaks, free stack for use-after-free). This baseline
 gets **type 11/11 and culprit 11/11, but root cause 2/11 and fix 0/11**, so
 explaining the cause and the fix is the part the model has to add. The unit
 tests (`ctest -L triage`) run offline against checked-in reports. They use a
-fake SDK client, plus a local HTTP stub for the real SDK when it is installed.
+fake HTTP transport, plus a local stub server that the real client talks to.
 
 ## Design documents
 

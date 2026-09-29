@@ -465,43 +465,44 @@ MEMLOC_STATS=1 LD_PRELOAD=~/build/memloc/src/libmemloc.so python3 -c 'print(1)'
 ## Phase 6: AI triage tool
 
 **Built**
-- `tools/triage.py` (300 lines, D-35 to D-39):
+- `tools/triage.py` (321 lines, D-35 to D-40):
   - Groups debug reports by a signature: the report type plus the innermost
     3 user functions of each stack.
   - Builds one prompt per group from the report and ±12 lines of source per
     user frame. Recorded paths that don't exist are re-rooted onto the checkout.
-  - Asks `claude-opus-5` (adaptive thinking, server-side fallbacks on) for
-    type, culprit, root cause, fix and confidence as schema-constrained JSON.
+  - Asks `openai/gpt-oss-120b` on Groq for type, culprit, root cause, fix and
+    confidence as strict schema-constrained JSON. It calls Groq through
+    `urllib`, with no SDK, and retries after `retry-after` on HTTP 429.
+  - The first version used Claude (`claude-opus-5`). D-40 switched to Groq
+    because the Claude API is paid and Groq has a free tier.
 - `eval` scores the 11 `tests/bugs` programs against `expected.json`.
   Type and culprit are exact matches. Root cause and fix are judged by a
   second model call, or by keyword recall offline. Every call is appended to
   a JSONL trace.
 - A rule-based mock is the offline default and doubles as the baseline.
-- `tests/triage/test_triage.py`: 12 stdlib unittest tests on 11 checked-in
-  reports (real `make bugs` output with paths rewritten). A fake SDK client
-  checks the request shape, refusals, invalid fields and API errors. One more
-  test drives the real SDK against a local HTTP stub and is skipped when
-  `anthropic` isn't installed. The tests are registered as ctest `triage_unit`.
-- `make triage-eval` (`LLM=mock` for offline) and
-  `tools/requirements-triage.txt`.
+- `tests/triage/test_triage.py`: 14 stdlib unittest tests on 11 checked-in
+  reports (real `make bugs` output with paths rewritten). A fake HTTP
+  transport checks the request shape, rate-limit retries, truncated output,
+  invalid fields, HTTP errors and a rejected key. One test runs the real
+  `urllib` client against a local stub server. The tests are registered as
+  ctest `triage_unit`.
+- `make triage-eval` (`LLM=mock` for offline).
 
 **Results**
 - Mock baseline on the 11 bugs: type 11/11, culprit 11/11, root cause 2/11
   (18 %), fix 0/11. 23 trace lines (12 triage calls, since the leak has two
   sites, plus 11 judge calls).
-- **The real Claude eval has not been run.** This machine has no API key,
-  and WSL's Python has no `anthropic` package. The request format was
-  checked with SDK 1.2.0 against the local stub (on Windows Python).
-  `make triage-eval` with a key is the remaining check.
+- **The real Groq eval has not been run yet.** It needs the author's free
+  `GROQ_API_KEY`. The client does reach the live endpoint: a bogus key gets
+  Groq's HTTP 401 back and stops the run. `make triage-eval` with a real key
+  is the remaining check.
 - ctest: gcc 64/64 (41 unit, 7 preload, 11 bugs, 4 bench smoke, 1 triage).
-  The triage tests pass on Python 3.14 (WSL, stub test skipped) and 3.13
-  (Windows, all 12).
+  The triage tests (all 14) pass on Python 3.14 (WSL) and 3.13 (Windows).
 
 **How to run**
 ```sh
 make triage-eval LLM=mock                         # offline baseline
-pip install -r tools/requirements-triage.txt
-ANTHROPIC_API_KEY=... make triage-eval            # real eval, trace in ~/build/memloc/triage-trace.jsonl
+GROQ_API_KEY=... make triage-eval                 # real eval, trace in ~/build/memloc/triage-trace.jsonl
 tools/triage.py report --llm mock tests/triage/reports/*.jsonl
 ctest --test-dir ~/build/memloc -L triage
 ```
@@ -514,8 +515,9 @@ ctest --test-dir ~/build/memloc -L triage
 2. *How do you test code that calls an LLM without calling it?* Split the
    deterministic parts (grouping, prompt, validation, scoring) from the call.
    Then test the call's contract with a fake client that records the request
-   and returns canned replies, including refusals and bad JSON. A stub HTTP
-   server checks that the real SDK puts the same fields on the wire.
+   and returns canned replies, including rate limits, truncation and bad
+   JSON. A stub HTTP server checks that the real client puts the same
+   fields on the wire.
 3. *Why is the baseline so strong on culprit?* The debug allocator already
    records the right stack for each bug type: the allocation stack for
    overflows, the free stack for use-after-free. Blaming the top user frame
