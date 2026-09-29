@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests for tools/triage.py (D-39). No network and no API key.
 
+The Groq transport is faked or pointed at a local stub server.
 The reports in tests/triage/reports are real `make bugs` output with the
 build and source paths rewritten, so they also exercise path re-rooting.
 """
@@ -8,14 +9,14 @@ from __future__ import annotations
 
 import copy
 import http.server
-import importlib.util
 import json
+import os
 import sys
 import tempfile
 import threading
-import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
@@ -31,28 +32,6 @@ GOOD = {"bug_type": "heap-buffer-overflow", "culprit_function": "copy_name",
 
 def first_group(name: str) -> dict:
     return next(iter(triage.group(triage.load_reports([REPORTS / f"{name}.jsonl"])).values()))
-
-
-class FakeClient:
-    """Stands in for anthropic.Anthropic(): records the request, returns a canned message."""
-
-    def __init__(self, text: str, stop_reason: str = "end_turn"):
-        self.calls: list[dict] = []
-        content = [types.SimpleNamespace(type="thinking", thinking=""),
-                   types.SimpleNamespace(type="text", text=text)]
-        reply = types.SimpleNamespace(model="claude-opus-5", stop_reason=stop_reason, content=content,
-                                      usage=types.SimpleNamespace(input_tokens=900, output_tokens=120))
-        create = lambda **kw: self.calls.append(kw) or reply
-        self.beta = types.SimpleNamespace(messages=types.SimpleNamespace(create=create))
-
-
-def claude(client) -> "triage.ClaudeLLM":
-    """A ClaudeLLM on a fake client. The anthropic package is optional in these tests."""
-    llm = triage.ClaudeLLM.__new__(triage.ClaudeLLM)
-    llm.model, llm.client = triage.MODEL, client
-    llm.anthropic = types.SimpleNamespace(AuthenticationError=type("A", (Exception,), {}),
-                                          APIError=type("E", (Exception,), {}))
-    return llm
 
 
 class Signatures(unittest.TestCase):
@@ -115,57 +94,88 @@ class MockBaseline(unittest.TestCase):
         self.assertEqual(summary["totals"], {"type": 0, "culprit": 0, "root_cause": 0, "fix": 0})
 
 
-class ClaudePath(unittest.TestCase):
+def reply(content: str, finish: str = "stop") -> dict:
+    return {"model": triage.MODEL, "usage": {"prompt_tokens": 900, "completion_tokens": 120},
+            "choices": [{"finish_reason": finish, "message": {"role": "assistant", "content": content}}]}
+
+
+class FakePost:
+    """Stands in for the HTTP transport: records each request body, replays canned responses."""
+
+    def __init__(self, *responses: tuple[int, dict, dict]):
+        self.responses, self.bodies = list(responses), []
+
+    def __call__(self, body: dict) -> tuple[int, dict, dict]:
+        self.bodies.append(body)
+        return self.responses.pop(0)
+
+
+def groq(*responses) -> "triage.GroqLLM":
+    return triage.GroqLLM(post=FakePost(*responses))
+
+
+class GroqPath(unittest.TestCase):
     def test_request_shape_and_parsing(self):
-        client = FakeClient(json.dumps(GOOD))
+        llm = groq((200, {}, reply(json.dumps(GOOD))))
         with tempfile.TemporaryDirectory() as d:
             trace = triage.Trace(Path(d) / "t.jsonl")
-            out = triage.triage_group(claude(client), first_group("off_by_one"), trace)
+            out = triage.triage_group(llm, first_group("off_by_one"), trace)
             entry = json.loads(trace.path.read_text())
         self.assertEqual(out["result"], GOOD)
-        kw = client.calls[0]
-        self.assertEqual(kw["model"], "claude-opus-5")
-        self.assertEqual(kw["thinking"], {"type": "adaptive"})
-        self.assertEqual(kw["output_config"]["format"]["schema"], triage.RESULT_SCHEMA)
-        self.assertEqual((kw["fallbacks"], kw["betas"]), ("default", ["server-side-fallback-2026-07-01"]))
-        self.assertIn("copy_name", kw["messages"][0]["content"])
-        self.assertEqual(entry["meta"]["usage"], {"input_tokens": 900, "output_tokens": 120})
+        body = llm.post.bodies[0]
+        self.assertEqual(body["model"], "openai/gpt-oss-120b")
+        fmt = body["response_format"]
+        self.assertEqual((fmt["type"], fmt["json_schema"]["strict"]), ("json_schema", True))
+        self.assertEqual(fmt["json_schema"]["schema"], triage.RESULT_SCHEMA)
+        self.assertEqual([m["role"] for m in body["messages"]], ["system", "user"])
+        self.assertIn("copy_name", body["messages"][1]["content"])
+        self.assertEqual(entry["meta"]["usage"], {"prompt_tokens": 900, "completion_tokens": 120})
         self.assertEqual(entry["signature"], out["signature"])
 
-    def test_refusal_is_recorded_not_raised(self):
-        out = triage.triage_group(claude(FakeClient("", "refusal")), first_group("leak"), triage.Trace(None))
+    def test_rate_limit_is_retried_after_the_advertised_delay(self):
+        llm = groq((429, {"retry-after": "0"}, {"error": {"message": "slow down"}}),
+                   (200, {}, reply(json.dumps(GOOD))))
+        with tempfile.TemporaryDirectory() as d:
+            trace = triage.Trace(Path(d) / "t.jsonl")
+            out = triage.triage_group(llm, first_group("off_by_one"), trace)
+            entry = json.loads(trace.path.read_text())
+        self.assertEqual(out["result"], GOOD)
+        self.assertEqual((len(llm.post.bodies), entry["meta"]["attempts"]), (2, 2))
+
+    def test_truncated_output_is_recorded_not_raised(self):
+        out = triage.triage_group(groq((200, {}, reply('{"bug_type": "le', "length"))),
+                                  first_group("leak"), triage.Trace(None))
         self.assertIsNone(out["result"])
-        self.assertIn("refusal", out["error"])
+        self.assertIn("length", out["error"])
 
     def test_invalid_fields_are_rejected(self):
         bad = dict(GOOD, confidence="certain")
-        out = triage.triage_group(claude(FakeClient(json.dumps(bad))), first_group("off_by_one"),
+        out = triage.triage_group(groq((200, {}, reply(json.dumps(bad)))), first_group("off_by_one"),
                                   triage.Trace(None))
         self.assertIn("enum", out["error"])
 
-    def test_api_errors_become_group_failures(self):
-        llm = claude(FakeClient(""))
-        llm.client.beta.messages.create = lambda **kw: (_ for _ in ()).throw(llm.anthropic.APIError("503"))
-        out = triage.triage_group(llm, first_group("off_by_one"), triage.Trace(None))
-        self.assertIn("503", out["error"])
+    def test_http_errors_become_group_failures(self):
+        out = triage.triage_group(groq((400, {}, {"error": {"message": "does not match the schema"}})),
+                                  first_group("off_by_one"), triage.Trace(None))
+        self.assertIn("HTTP 400: does not match the schema", out["error"])
+
+    def test_bad_key_stops_the_run(self):
+        with self.assertRaises(SystemExit):
+            triage.triage_group(groq((401, {}, {"error": {"message": "invalid key"}})),
+                                first_group("off_by_one"), triage.Trace(None))
 
 
-@unittest.skipUnless(importlib.util.find_spec("anthropic"), "anthropic package not installed")
-class RealSdkAgainstStub(unittest.TestCase):
-    """The real SDK against a local HTTP stub: checks the wire format, still offline."""
+class RealClientAgainstStub(unittest.TestCase):
+    """The real urllib transport against a local HTTP stub: the wire format, still offline."""
 
     def test_wire_request(self):
-        import anthropic
         seen = {}
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
-                seen["path"], seen["beta"] = self.path, self.headers.get("anthropic-beta")
+                seen["path"], seen["auth"] = self.path, self.headers.get("Authorization")
                 seen["body"] = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                body = json.dumps({"id": "msg_1", "type": "message", "role": "assistant",
-                                   "model": "claude-opus-5", "stop_reason": "end_turn",
-                                   "stop_sequence": None, "usage": {"input_tokens": 5, "output_tokens": 7},
-                                   "content": [{"type": "text", "text": json.dumps(GOOD)}]}).encode()
+                body = json.dumps(reply(json.dumps(GOOD))).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -177,21 +187,18 @@ class RealSdkAgainstStub(unittest.TestCase):
 
         server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{server.server_port}/openai/v1/chat/completions"
         try:
-            client = anthropic.Anthropic(api_key="test", max_retries=0,
-                                         base_url=f"http://127.0.0.1:{server.server_port}")
-            result, meta = triage.ClaudeLLM(client=client).triage("prompt", {})
-            client.close()
+            with mock.patch.dict(os.environ, {"GROQ_API_KEY": "test-key"}):
+                result, meta = triage.GroqLLM(url=url).triage("prompt", {})
         finally:
             server.shutdown()
             server.server_close()
         self.assertEqual(result, GOOD)
-        self.assertEqual(meta["usage"], {"input_tokens": 5, "output_tokens": 7})
-        self.assertTrue(seen["path"].startswith("/v1/messages"))
-        self.assertIn("server-side-fallback-2026-07-01", seen["beta"])
-        self.assertEqual(seen["body"]["fallbacks"], "default")
-        self.assertEqual(seen["body"]["output_config"]["format"]["type"], "json_schema")
-        self.assertEqual(seen["body"]["thinking"], {"type": "adaptive"})
+        self.assertEqual(meta["attempts"], 1)
+        self.assertEqual(seen["path"], "/openai/v1/chat/completions")
+        self.assertEqual(seen["auth"], "Bearer test-key")
+        self.assertEqual(seen["body"]["response_format"]["json_schema"]["name"], "triage")
 
 
 if __name__ == "__main__":
